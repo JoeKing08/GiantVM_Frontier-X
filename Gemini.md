@@ -382,12 +382,22 @@ qemu-system-x86_64 -accel giantvm,mode=kernel ...
 **场景 B: 容器化/公有云部署 (Mode B - User)**
 ```bash
 # 1. 直接启动用户态 Master
-# 参数: <RAM_MB> <PORT> <CONFIG_FILE> <SYNC_BATCH>
-./master_core/giantvm_master_user 65536 9000 master_routes.txt 1024 &
+# 参数: <RAM_MB> <PORT> <CONFIG_FILE> <TOTAL_SLAVES>
+# TOTAL_SLAVES 必须填 400 (320 + 80)，严禁填 1024 或其他随意值
+./master_core/giantvm_master_user 65536 9000 master_routes.txt 400 &
 
 # 2. 启动 QEMU (User Mode)
 # 会自动连接 /tmp/giantvm.sock
-qemu-system-x86_64 -accel giantvm,mode=user ...
+# 假设总共 400 个 vCPU，分为 10 个物理节点 (D0-D9)
+# 我们需要定义 10 个 NUMA 节点，每个节点包含对应的 vCPU 范围
+qemu-system-x86_64 -accel giantvm,mode=user ... \
+  -smp 400 \
+  -m 512G \
+  -object memory-backend-ram,id=mem0,size=51G \
+  -numa node,nodeid=0,cpus=0-63,memdev=mem0 \
+  -object memory-backend-ram,id=mem1,size=51G \
+  -numa node,nodeid=1,cpus=64-127,memdev=mem1 \
+  ... (以此类推，直到 nodeid=9)
 ```
 
 ---
@@ -500,10 +510,10 @@ echo "[+] Network buffers boosted to 50MB."
 #define GVM_ROUTE_TABLE_SIZE GVM_MAX_SLAVES 
 #define GVM_CPU_ROUTE_TABLE_SIZE 4096 // 支持最大 4k 虚拟核心映射
 
-// 3. 统一 V26.4 资源解耦路由算法 (加盐哈希扰动)
-// 内存哈希：GPA -> 槽位
+// 3. 内存哈希：GPA -> 槽位
+// 纯净的条带化哈希 (保留 2MB 连续性)
 #define GVM_GET_MEM_HASH(gpa) \
-    ((uint32_t)((((uint64_t)(gpa) >> GVM_AFFINITY_SHIFT) ^ 0x9527U) * 2654435761U) % GVM_ROUTE_TABLE_SIZE)
+    ((uint32_t)((uint64_t)(gpa) >> GVM_AFFINITY_SHIFT) % GVM_ROUTE_TABLE_SIZE)
 
 #endif // GIANTVM_CONFIG_H
 ```
@@ -759,7 +769,7 @@ extern struct dsm_driver_ops *g_ops;
 #ifndef LOGIC_CORE_H
 #define LOGIC_CORE_H
 #include "unified_driver.h"
-int gvm_core_init(struct dsm_driver_ops *ops);
+int gvm_core_init(struct dsm_driver_ops *ops, int active_slave_count);
 int gvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer);
 int gvm_sync_page_write_logic(uint64_t gpa, void *page_buffer, int len);
 #endif
@@ -789,20 +799,20 @@ static int g_pkt_counter = 0;
 static uint16_t g_mem_route_table[GVM_ROUTE_TABLE_SIZE];
 static uint32_t g_cpu_route_table[GVM_CPU_ROUTE_TABLE_SIZE];
 
-int gvm_core_init(struct dsm_driver_ops *ops) {
+int gvm_core_init(struct dsm_driver_ops *ops, int active_slave_count) {
     if (!ops) return -1;
     g_ops = ops;
 
     // 初始化内存路由表 (1:1 覆盖全集群)
     for (int i = 0; i < GVM_ROUTE_TABLE_SIZE; i++) {
-        g_mem_route_table[i] = (uint16_t)(i % GVM_MAX_SLAVES);
+        g_mem_route_table[i] = (uint16_t)(i % active_slave_count);
     }
     // 初始化 CPU 路由表 (将 vCPU 均匀散布到 10 万个节点中)
     for (int i = 0; i < GVM_CPU_ROUTE_TABLE_SIZE; i++) {
-        g_cpu_route_table[i] = (uint32_t)(i % GVM_MAX_SLAVES);
+        g_cpu_route_table[i] = (uint32_t)(i % active_slave_count);
     }
 
-    g_ops->log("GiantVM Core V26.4: Decoupled Logic Active. Scale: %lu nodes.", GVM_MAX_SLAVES);
+    g_ops->log("GiantVM Core: Round-Robin Routing Table Inited with %d slaves.", active_slave_count);
     return 0;
 }
 
@@ -1359,6 +1369,10 @@ static struct miscdevice gvm_misc = { .minor=MISC_DYNAMIC_MINOR, .name="giantvm"
 module_param_named(sync_batch, g_sync_batch_size, int, 0644);
 MODULE_PARM_DESC(sync_batch, "Batch size for dirty page sync (0=off, 1=strict, >1=buffered)");
 
+static int active_slaves = GVM_MAX_SLAVES; // 默认填满，避免除以0
+module_param(active_slaves, int, 0644);
+MODULE_PARM_DESC(active_slaves, "Total number of active slave instances");
+
 static int __init giantvm_init(void) {
     int ret, cpu;
     struct sockaddr_in bind_addr;
@@ -1389,7 +1403,7 @@ static int __init giantvm_init(void) {
         return PTR_ERR(g_tx_ring.thread);
     }
 
-    if (gvm_core_init(&k_ops) != 0) return -ENOMEM;
+    if (gvm_core_init(&k_ops, active_slaves) != 0) return -ENOMEM;
     if (misc_register(&gvm_misc)) return -ENODEV;
     if (sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP, &g_socket) < 0) return -EIO;
 
@@ -1501,6 +1515,8 @@ static void* u_alloc_large_table(size_t size) { return calloc(1, size); }
 static void u_free_large_table(void *ptr) { free(ptr); }
 static void* u_alloc_packet(size_t size, int atomic) { return malloc(size); }
 static void u_free_packet(void *ptr) { free(ptr); }
+pthread_cond_t pool_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t u_alloc_req_id(void *rx_buffer) {
     uint64_t id;
@@ -1532,18 +1548,13 @@ static uint64_t u_alloc_req_id(void *rx_buffer) {
         // [修改 3] 复用 logic_core.c 的三段式退避逻辑
         loop_count++;
         
-        // 阶段 1: 自旋 (Spin) - 前 2000 次尝试只消耗 CPU 周期，不切换上下文
         if (loop_count < 2000) {
-            #if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause(); // 硬件级 Pause，减少流水线冲突
-            #endif
-        } 
-        // 阶段 2: 睡眠 (Sleep) - 超过 2000 次说明池子很满，开始睡眠
-        else {
-            usleep(1); // 对应 u_relax 实现，让出 CPU 防止死锁
-            
-            // 限制计数器上限，保持在这个阶段
-            if (loop_count > 3000) loop_count = 2000;
+            __builtin_ia32_pause(); // 极致自旋
+        } else {
+            // 放弃 usleep，改用带锁的等待，由 free 动作唤醒
+            pthread_mutex_lock(&g_pool_mutex); 
+            pthread_cond_wait(&pool_cond, &g_pool_mutex); 
+            pthread_mutex_unlock(&g_pool_mutex);
         }
     }
     return id;
@@ -1554,6 +1565,7 @@ static void u_free_req_id(uint64_t id) {
     pthread_mutex_lock(&g_u_req_ctx[idx].lock);
     if (g_u_req_ctx[idx].full_id == id) g_u_req_ctx[idx].rx_buffer = NULL;
     pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+    pthread_cond_signal(&pool_cond);
 }
 
 // 处理来自 Slave 的读请求
@@ -1683,13 +1695,13 @@ static void GVM_PRINTF_LIKE(1, 2) u_log(const char *fmt, ...) {
     // 加上时间戳前缀，方便调试
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    fprintf(stderr, "[%ld.%06ld] [GVM-Master] ", tv.tv_sec, tv.tv_usec);
+    //fprintf(stderr, "[%ld.%06ld] [GVM-Master] ", tv.tv_sec, tv.tv_usec);
 
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    //vfprintf(stderr, fmt, args);
     va_end(args);
     
-    fprintf(stderr, "\n");
+    //fprintf(stderr, "\n");
 }
 static int u_atomic_ctx(void) { return 0; }
 static void u_touch(void) {}
@@ -1874,11 +1886,10 @@ void load_gateway_config(const char *filename) {
 
 int main(int argc, char **argv) {
     // Usage: ./master <RAM_MB> <LOCAL_PORT> <GW_CONFIG_FILE> [SYNC_BATCH]
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <RAM_MB> <LOCAL_PORT> <GW_CONFIG_FILE> [SYNC_BATCH]\n", argv[0]);
-        fprintf(stderr, "Example: %s 8192 9000 gateway_list.txt 1024\n", argv[0]);
-        return 1;
-    }
+    if (argc < 5) {
+    fprintf(stderr, "Usage: %s <RAM_MB> <PORT> <GW_CONFIG_FILE> <TOTAL_SLAVES> [SYNC_BATCH]\n", argv[0]);
+    return 1;
+}
 
     // 1. 解析内存大小
     g_shm_size = (size_t)atol(argv[1]) * 1024 * 1024;
@@ -1889,9 +1900,13 @@ int main(int argc, char **argv) {
     // 3. 获取配置文件路径
     const char *gw_config_file = argv[3];
 
-    // 4. 解析 Sync Batch (可选)
-    if (argc >= 5) {
-        g_sync_batch_size = atoi(argv[4]);
+    // 4. 声明并赋值 total_slaves
+    int total_slaves = atoi(argv[4]);
+    if (total_slaves <= 0) total_slaves = 1; // 兜底防止除0崩溃
+
+    // 5. 解析 Sync Batch (可选)
+    if (argc >= 6) {
+        g_sync_batch_size = atoi(argv[5]);
         printf("[Config] Sync Batch Size set to: %d\n", g_sync_batch_size);
     }
 
@@ -1902,7 +1917,7 @@ int main(int argc, char **argv) {
     if (user_backend_init(local_port) != 0) die("user_backend_init failed");
     
     // 初始化逻辑核心
-    if (gvm_core_init(&u_ops) != 0) die("gvm_core_init failed");
+    if (gvm_core_init(&u_ops, total_slaves) != 0) die("Core init failed");
     
     // 加载 Gateway 配置文件 (这里已经完成了所有 Gateway 的 IP 设置)
     load_gateway_config(gw_config_file);
@@ -2149,6 +2164,14 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct gvm
 }
 
 void handle_kvm_mem(int sockfd, struct sockaddr_in *client, struct gvm_header *hdr, void *payload) {
+    uint64_t current_id = hdr->req_id;
+    // 判断递增 ID，防止 UDP 乱序导致的旧页覆盖新页
+    if (hdr->msg_type == MSG_MEM_WRITE) {
+        if (current_id < last_mem_req_id && (last_mem_req_id - current_id) < 0xFFFFFFFF) {
+            return; // 丢弃旧包
+        }
+        last_mem_req_id = current_id;
+    }
     if (hdr->msg_type == MSG_MEM_READ) {
         uint64_t gpa = *(uint64_t*)payload;
         struct gvm_header ack_hdr;
@@ -3121,7 +3144,7 @@ static void giantvm_remote_exec(CPUState *cpu) {
         int ret = ioctl(s->dev_fd, IOCTL_GVM_REMOTE_RUN, &req);
         
         if (ret < 0) {
-            fprintf(stderr, "GiantVM: Remote Run IOCTL failed: %s\n", strerror(errno));
+            //fprintf(stderr, "GiantVM: Remote Run IOCTL failed: %s\n", strerror(errno));
             return;
         }
 
@@ -3227,7 +3250,6 @@ static void giantvm_remote_exec(CPUState *cpu) {
 
     // 3. 网络接收 (阻塞本线程，不影响其他 vCPU)
     ssize_t len = read(vcpu_sock, buf, sizeof(buf));
-    // [V25.4 REMOVED] qemu_mutex_unlock(&s->ipc_lock);
     
     if (len < sizeof(struct gvm_header)) return;
     
@@ -3490,9 +3512,8 @@ static void ensure_tls_buffer(void) {
 
 static void set_page_dirty(uint64_t gpa) {
     uint64_t page_idx = gpa >> 12;
-    pthread_mutex_lock(&g_bitmap_lock);
-    g_dirty_bitmap[page_idx / 64] |= (1UL << (page_idx % 64));
-    pthread_mutex_unlock(&g_bitmap_lock);
+    // 使用 GCC 内置原子操作，无需锁
+    __sync_fetch_and_or(&g_dirty_bitmap[page_idx / 64], (1UL << (page_idx % 64)));
 }
 
 // =============================================================
@@ -3546,7 +3567,7 @@ static int request_page_sync(uintptr_t fault_addr) {
         if (ret == 0) {
             // 每 5 秒打印一次警告，但不退出
             if (retries % 50 == 0) {
-                fprintf(stderr, "[GiantVM] Warning: Waiting for page %lx... (Master busy?)\n", gpa);
+                //fprintf(stderr, "[GiantVM] Warning: Waiting for page %lx... (Master busy?)\n", gpa);
                 // 这里可以选择重发请求，防止 UDP 丢包导致的永久等待
                 send(g_fd_req, t_net_buf, sizeof(struct gvm_header) + 8, 0); 
             }
@@ -3601,7 +3622,7 @@ static void sigsegv_handler(int sig, siginfo_t *si, void *ucontext) {
             mprotect((void*)aligned_addr, 4096, PROT_READ);
         }
     } else {
-        fprintf(stderr, "[GiantVM] Critical: Network Fault at 0x%lx\n", addr);
+        //fprintf(stderr, "[GiantVM] Critical: Network Fault at 0x%lx\n", addr);
         signal(SIGSEGV, SIG_DFL); raise(SIGSEGV);
     }
 }
