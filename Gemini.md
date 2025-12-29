@@ -1973,7 +1973,7 @@ clean:
 
 ---
 
-## Step 6: Slave 守护进程 (Slave Daemon - Raw io_uring)
+## Step 6: Slave 守护进程 (Slave Daemon)
 
 **文件**: `slave_daemon/slave_hybrid.c`
 
@@ -4152,85 +4152,123 @@ clean:
 
 此代码在 Windows 虚拟机内部编译运行（需要 MSVC 或 MinGW），用于配合 GiantVM 的内存拦截机制。通过模拟大页分配和访问模式，向底层 Hypervisor 暗示虚拟 NUMA 拓扑。
 
-**文件**: `guest_tools/win_memory_hint.cpp`
+**文件**: `guest_tools/win_memory_hint.c`
 
 ```cpp
 #include <windows.h>
-#include <iostream>
-#include <vector>
-#include <exception>
+#include <stdio.h>
+#include <stdlib.h>
 
 /*
- * GiantVM vNUMA Hint Tool for Frontier-X V26
- * Target: Windows Guest OS
+ * GiantVM Windows Guest Tool (Pure C Version)
+ * 作用：利用 Windows 原生 NUMA API 实现内存与特定 Slave 节点的亲和性绑定
  */
 
-// Define generic structure if not available
-typedef struct _GVM_NUMA_NODE {
-    DWORD NodeNumber;
-    DWORD64 AvailableMemory;
-} GVM_NUMA_NODE;
-
-// [修改] 明确声明参数为 void，消除歧义
-void InjectFakeNUMATopology(void) {
-    std::cout << "[*] GiantVM: Injecting vNUMA Hints..." << std::endl;
-    
-    // 1. Enable Large Pages Privilege
+// 启用大页内存所需的特权
+static int EnableLargePagePrivilege() {
     HANDLE hToken;
     TOKEN_PRIVILEGES tp;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid);
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, (PTOKEN_PRIVILEGES)NULL, 0);
-        CloseHandle(hToken);
+    LUID luid;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return 0;
     }
 
-    // 2. Allocate Large Page Memory
+    if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+        CloseHandle(hToken);
+        return 0;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0)) {
+        CloseHandle(hToken);
+        return 0;
+    }
+
+    CloseHandle(hToken);
+    return 1;
+}
+
+void InjectFakeNUMATopology() {
+    printf("[*] GiantVM: Injecting vNUMA Hints (Pure C)...\n");
+
+    // 1. 提权
+    if (!EnableLargePagePrivilege()) {
+        printf("[!] Failed to get SE_LOCK_MEMORY privilege. Large pages might fail.\n");
+    }
+
+    // 2. 获取当前 vCPU 所在的虚拟 NUMA 节点
+    PROCESSOR_NUMBER procNum;
+    GetCurrentProcessorNumberEx(&procNum);
+    USHORT node;
+    if (!GetNumaProcessorNodeEx(&procNum, &node)) {
+        printf("[-] Cannot determine NUMA node. Error: %lu\n", GetLastError());
+        return;
+    }
+
+    // 3. 按照 GiantVM V26.7 的 Stripe 大小 (2MB) 分配内存
+    // 对齐 GVM_AFFINITY_SHIFT 21 (2MB)
     SIZE_T size = 1024 * 1024 * 2; 
-    void* ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
     
-    if (ptr) {
-        std::cout << "[+] 2MB HugePage Allocated at: 0x" << ptr << std::endl;
-        
-        if (VirtualLock(ptr, size)) {
-            std::cout << "[+] Memory Locked (Pinned)." << std::endl;
-        } else {
-             std::cerr << "[-] VirtualLock failed. Error: " << GetLastError() << std::endl;
-        }
+    // 优先尝试分配大页内存并绑定到当前节点
+    void* ptr = VirtualAllocExNuma(
+        GetCurrentProcess(),
+        NULL,
+        size,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        PAGE_READWRITE,
+        node
+    );
 
-        // 4. Access Pattern to Trigger Fault
-        volatile int* data = (volatile int*)ptr;
-        
-        // [修改] 移除 catch(...)，改用 SEH (__try/__except) 或直接运行
-        // 在 Windows 上，内存访问违例(Access Violation) 是 SEH 异常，标准 C++ catch 捕获不到。
-        // 为了代码简洁且“好写”，我们利用 Windows API IsBadWritePtr 预检，或者直接写入
-        // 如果底层没有映射，这里会 Crash，符合 Guest Tool 的预期（暴露问题）
-        
-        __try {
-            *data = 0xGVMX; // Magic write to trigger EPT violation
-            std::cout << "[+] Memory touched successfully." << std::endl;
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
-            std::cerr << "[!] Exception during memory touch (EPT Violation not handled?)." << std::endl;
-        }
+    if (!ptr) {
+        printf("[!] Large page allocation failed. Falling back to 4KB pages on Node %d...\n", node);
+        ptr = VirtualAllocExNuma(
+            GetCurrentProcess(),
+            NULL,
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+            node
+        );
+    }
 
-    } else {
-        std::cerr << "[-] Failed to alloc HugePages. Check Policy." << std::endl;
-        // Fallback
-        ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (ptr) std::cout << "[!] Fallback: Standard 4K pages allocated." << std::endl;
+    if (!ptr) {
+        printf("[-] Critical: Allocation failed on Node %d. Error: %lu\n", node, GetLastError());
+        return;
+    }
+
+    printf("[+] Memory Striping: 2MB Buffer at %p bound to Node %d\n", ptr, node);
+
+    // 4. 【关键修正】全页触碰逻辑 (4KB 步长)
+    // 必须每隔 4KB 写入一次，才能触发 GiantVM 用户态拦截器的 SIGSEGV 或内核态的 Page Fault
+    volatile char* p = (volatile char*)ptr;
+    
+    // 使用 Windows 的 SEH 机制处理可能的网络异常导致的数据不一致
+    __try {
+        for (SIZE_T i = 0; i < size; i += 4096) {
+            // 写入 Magic "GVMX" (0x47564d58) 的首字节 'G'
+            p[i] = 0x47; 
+        }
+        printf("[+] vNUMA Stripe 0x%p Synchronized successfully.\n", ptr);
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        printf("[-] Exception: Network fault during memory touch at offset %llu\n", (unsigned long long)0);
     }
 }
 
 int main() {
-    std::cout << "GiantVM Frontier-X V26 Guest Tool" << std::endl;
-    std::cout << "=================================" << std::endl;
-    
+    printf("GiantVM Frontier-X V26.7 Windows Guest Tool (C)\n");
+    printf("================================================\n");
+
     InjectFakeNUMATopology();
-    
-    std::cout << "[*] Optimization Complete. Sleeping..." << std::endl;
-    while (true) { Sleep(10000); }
+
+    printf("[*] Optimization Complete. Sleeping...\n");
+    while (1) {
+        Sleep(10000);
+    }
     return 0;
 }
 ```
@@ -4246,39 +4284,36 @@ int main() {
 #include <stdlib.h>
 #include <unistd.h>
 
-/*
- * GiantVM Linux Guest Tool
- * 作用：确保本进程分配的内存在“物理上”就在当前 Slave 节点。
- */
-
+// 修正后的代码
 int main() {
-    if (numa_available() < 0) {
-        printf("NUMA not supported by kernel.\n");
-        return 1;
-    }
+    if (numa_available() < 0) return 1;
 
-    // 1. 获取当前 CPU 所在的节点
+    // 1. 获取当前节点
     int cpu = sched_getcpu();
     int node = numa_node_of_cpu(cpu);
-    printf("[*] Running on CPU %d, Node %d\n", cpu, node);
 
-    // 2. 分配 2MB 大页内存 (对齐 GiantVM 的传输单位)
+    // 2. 分配 2MB 内存，必须对齐到 2MB (1<<21)
+    // 这是为了匹配 V26.7 的 GVM_AFFINITY_SHIFT 21
     size_t size = 2 * 1024 * 1024;
-    void *ptr = aligned_alloc(size, size);
+    void *ptr;
+    if (posix_memalign(&ptr, size, size) != 0) return 1;
 
-    // 3. 核心：mbind 强制绑定
-    // 告诉 Linux：这块虚拟内存对应的物理页，必须从 node 节点申请
+    // 3. 强制绑定
     unsigned long nodemask = (1UL << node);
     if (mbind(ptr, size, MPOL_BIND, &nodemask, sizeof(nodemask)*8, 0) < 0) {
-        perror("mbind failed");
+        perror("mbind");
         return 1;
     }
 
-    // 4. 触发写操作 (First Touch)
-    // 此时 Master 会收到 MSG_MEM_READ，由于逻辑对齐，包会发往对应的 Slave
-    *(volatile int*)ptr = 0xGVMX;
+    // 4. 【关键修正】全页触碰
+    // 每 4KB 写入一次数据，强制 Master 从对应的 Slave 拉取内存
+    volatile char *p = (volatile char *)ptr;
+    for (size_t i = 0; i < size; i += 4096) {
+        p[i] = 0x47; // "G"
+    }
 
-    printf("[+] Memory bound to node %d and pre-faulted.\n", node);
+    printf("[+] Linux vNUMA Deception: Page range %p - %p locked to Node %d\n", 
+           ptr, (char*)ptr + size, node);
     
     while(1) sleep(100);
     return 0;
@@ -4289,14 +4324,7 @@ int main() {
 
 ### 全局完成确认
 
-至此，GiantVM "Frontier-X" V16 的所有代码模块（Step 0 到 Step 10）均已生成完毕。
-
-1.  **内核态**: `kernel_backend.c` (死锁防护, `vzalloc` 大表, `mmap` 拦截).
-2.  **核心逻辑**: `logic_core.c` (RUDP 可靠传输, 无状态路由).
-3.  **用户态**: `user_backend.c` (兼容性后端), `gateway_service` (Lazy Alloc 聚合).
-4.  **前端**: `qemu_patch` (AccelClass 集成).
-5.  **从节点**: `slave_daemon` (Raw Syscall io_uring).
-6.  **工具**: `ctl_tool` (无依赖注入), `guest_tools` (Win32 API).
+至此，GiantVM "Frontier-X" V26.7 的所有代码模块（Step 0 到 Step 10）均已生成完毕。
 
 **建议编译顺序**:
 1.  `master_core` (Kernel Module)
