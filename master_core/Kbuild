@@ -1,0 +1,11 @@
+
+# 定义模块名称
+obj-m += giantvm.o
+
+# 定义模块包含的目标文件
+# 将逻辑核心 (Logic Core) 和内核后端 (Kernel Backend) 链接为一个 .ko 文件
+giantvm-y := kernel_backend.o logic_core.o
+
+# 添加公共头文件路径
+# $(src) 是内核构建系统提供的变量，指向当前目录
+ccflags-y := -I$(src)/../common_include

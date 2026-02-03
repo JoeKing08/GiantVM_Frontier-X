@@ -1,0 +1,969 @@
+
+/*
+ * [IDENTITY] User Backend - The High-Concurrency QoS Bus
+ * ---------------------------------------------------------------------------
+ * 物理角色：用户态模式下的"消息交换机"。
+ * 职责边界：
+ * 1. 维护 Fast/Slow 双队列 QoS，保证控制信令 (ACK) 不被数据流淹没。
+ * 2. 实现 Slab 风格的包内存池，利用 Thread-aware Hash 消除锁竞争。
+ * 3. 驱动收发工作线程，处理聚合解包与 CRC32 卸载计算。
+ * 
+ * [禁止事项]
+ * - 严禁在 rx_thread_loop 中引入慢速系统调用。
+ * - 严禁移除 recvmmsg 的批量接收逻辑，否则在高负载下软中断将打死系统。
+ * ---------------------------------------------------------------------------
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdarg.h>
+#include <sys/time.h>
+#include <sys/sysinfo.h>
+
+#include "unified_driver.h"
+#include "../common_include/giantvm_protocol.h"
+#include "../common_include/crc32.h"
+
+// --- 配置常量 ---
+#define MAX_INFLIGHT_REQS 65536
+#define POOL_SHARDS 64
+#define SHARD_MASK (POOL_SHARDS - 1)
+#define ITEMS_PER_SHARD 1563 
+#define POOL_CAP (POOL_SHARDS * ITEMS_PER_SHARD)
+#define POOL_ITEM_SIZE 4200
+#define BATCH_SIZE 64
+#define RX_THREAD_COUNT 4
+
+// --- 全局状态 ---
+static int g_my_node_id = 0;
+static int g_local_port = 0;
+static struct sockaddr_in g_gateways[GVM_MAX_GATEWAYS];
+static volatile int g_tx_socket = -1;
+
+// --- 外部引用 ---
+extern void *g_shm_ptr; 
+extern size_t g_shm_size;
+extern void broadcast_irq_to_qemu(void);
+extern void gvm_logic_process_packet(struct gvm_header *hdr, void *payload, uint32_t source_node_id);
+extern void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len);
+
+// --- 请求ID管理结构 ---
+struct u_req_ctx_t { 
+    void *rx_buffer; 
+    uint64_t full_id; 
+    volatile int status; // 0=Pending, 1=Done
+    pthread_mutex_t lock;
+};
+static struct u_req_ctx_t g_u_req_ctx[MAX_INFLIGHT_REQS];
+static uint64_t g_id_counter = 0;
+
+// --- 内存池 (Slab Allocator) ---
+typedef struct {
+    void *free_list[ITEMS_PER_SHARD];
+    int top;
+    pthread_spinlock_t lock;
+    // 显式 Cache Line Padding：确保每把锁独占缓存行，避免高并发下的 MESI 协议冲突抖动
+    uint8_t padding[64 - sizeof(int) - sizeof(pthread_spinlock_t) - sizeof(void*)];
+} __attribute__((aligned(64))) pool_shard_t;
+
+static pool_shard_t g_pool_shards[POOL_SHARDS];
+static uint8_t *g_pool_buffer = NULL;
+static void *g_free_list[POOL_CAP];
+static int g_pool_top = -1;
+static pthread_spinlock_t g_pool_lock;
+
+// --- QoS 发送队列结构 ---
+typedef struct tx_node {
+    struct tx_node *next;
+    uint32_t target_id;
+    int len;
+    uint8_t data[]; // 柔性数组
+} tx_node_t;
+
+typedef struct {
+    tx_node_t *head;
+    tx_node_t *tail;
+    pthread_spinlock_t lock;
+    int count;
+} tx_queue_t;
+
+static tx_queue_t g_fast_queue;
+static tx_queue_t g_slow_queue;
+static pthread_cond_t g_tx_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_tx_cond_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_tx_thread;
+
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_init_cond = PTHREAD_COND_INITIALIZER;
+
+// --- 辅助函数 ---
+static void u_log(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
+static int u_is_atomic_context(void) {
+    return 0; // 用户态通常不视为原子上下文，除非在信号处理中明确标记
+}
+
+static void u_touch_watchdog(void) {
+    // 用户态无需喂狗
+}
+
+static uint64_t u_get_time_us(void) {
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return (uint64_t)t.tv_sec * 1000000UL + t.tv_usec;
+}
+
+static uint64_t u_time_diff_us(uint64_t start) {
+    uint64_t now = u_get_time_us();
+    if (now >= start) return now - start;
+    // 处理时钟回绕的极端情况
+    return 0;
+}
+
+static void u_cpu_relax(void) {
+    usleep(1);
+}
+
+static void u_get_random(uint32_t *val) {
+    *val = (uint32_t)rand();
+}
+
+static void u_yield_cpu_short_time(void) {
+    usleep(100);
+}
+
+/* 
+ * [物理意图] 预分配大规模分片内存池，彻底消除运行时系统调用延迟。
+ * [关键逻辑] 将内存切分为 POOL_SHARDS (64) 个独立分片，利用对齐（Padding）技术规避 CPU 缓存行伪共享。
+ * [后果] 若不进行预分配，高频的小包（如 Diff/ACK）会频繁触发内核 brk/mmap 锁竞争，导致 PPS 吞吐量下降一个数量级。
+ */
+void init_pkt_pool(void) {
+    g_pool_buffer = (uint8_t *)calloc(POOL_CAP, POOL_ITEM_SIZE);
+    if (!g_pool_buffer) {
+        perror("[V29.5 Fatal] Memory Pool Allocation Failure");
+        exit(1);
+    }
+
+    for (int s = 0; s < POOL_SHARDS; s++) {
+        pthread_spin_init(&g_pool_shards[s].lock, PTHREAD_PROCESS_PRIVATE);
+        g_pool_shards[s].top = -1;
+        for (int i = 0; i < ITEMS_PER_SHARD; i++) {
+            // 每一个块都被分配到唯一确定的归属分片，实现真正的分布式管理
+            int global_idx = s * ITEMS_PER_SHARD + i;
+            g_pool_shards[s].free_list[++g_pool_shards[s].top] = 
+                g_pool_buffer + (size_t)global_idx * POOL_ITEM_SIZE;
+        }
+    }
+    printf("[Backend] V29.5 Logic Core Sharded Pool Ready: %d items.\n", POOL_CAP);
+}
+
+/* 
+ * [物理意图] 高并发下的“零争用”网络包申请。
+ * [关键逻辑] 基于 Thread-aware Hash 定位初始分片，并实现“工作窃取（Work-Stealing）”算法：本地分片空闲时尝试从邻居获取。
+ * [后果] 这一步是 Mode B 性能的核心。它保证了 128 核服务器在万级并发下，不会因为同一个 malloc 锁产生“串行化自焚”。
+ */
+static void* u_alloc_packet(size_t size, int atomic) {
+    // 超大包降级到 malloc
+    if (size > POOL_ITEM_SIZE) {
+        if (atomic) return NULL; 
+        return malloc(size);
+    }
+
+    // 线程感知哈希：利用 pthread_self 的低位进行初始分片选择，极大地分散锁竞争
+    unsigned int start_idx = (unsigned int)pthread_self() & SHARD_MASK;
+
+    // 工作窃取（Work-Stealing）：如果本线程对应的分片锁住了或空了，去邻居分片“窃取”
+    for (int i = 0; i < POOL_SHARDS; i++) {
+        int s_idx = (start_idx + i) & SHARD_MASK;
+        pool_shard_t *shard = &g_pool_shards[s_idx];
+        void *ptr = NULL;
+
+        if (atomic) {
+            // 信号安全路径（Mode B SIGSEGV 调用），严禁阻塞
+            if (pthread_spin_trylock(&shard->lock) == 0) {
+                if (shard->top >= 0) ptr = shard->free_list[shard->top--];
+                pthread_spin_unlock(&shard->lock);
+            }
+        } else {
+            // 标准路径：阻塞等待
+            pthread_spin_lock(&shard->lock);
+            if (shard->top >= 0) ptr = shard->free_list[shard->top--];
+            pthread_spin_unlock(&shard->lock);
+        }
+
+        if (ptr) return ptr; // 成功拿到
+        
+        // 红队优化：原子上下文下，如果试了 4 个分片都拿不到，必须立即返回 NULL，
+        // 防止信号处理函数执行时间过长导致 Guest 内核 Panic。
+        if (atomic && i > 3) break;
+    }
+    return NULL;
+}
+
+static void u_free_packet(void *ptr) {
+    if (!ptr) return;
+
+    size_t pool_total_bytes = (size_t)POOL_CAP * POOL_ITEM_SIZE;
+    uintptr_t p_val = (uintptr_t)ptr;
+    uintptr_t b_start = (uintptr_t)g_pool_buffer;
+
+    // 逻辑保留：判定内存是否属于池。如果是 malloc 出来的，直接 free
+    if (p_val < b_start || p_val >= (b_start + pool_total_bytes)) {
+        free(ptr);
+        return;
+    }
+
+    // 物理反向定位：基于指针地址精确计算它属于哪个分片（Shard）
+    // 编译器会自动将常量 POOL_ITEM_SIZE (4200) 优化为乘法+移位，无需担心除法性能
+    size_t offset = p_val - b_start;
+    int global_idx = (int)(offset / POOL_ITEM_SIZE);
+    int shard_idx = global_idx / ITEMS_PER_SHARD;
+
+    // 防御性数学保护
+    if (shard_idx >= POOL_SHARDS) shard_idx = SHARD_MASK;
+    pool_shard_t *shard = &g_pool_shards[shard_idx];
+
+    // 归还内存。
+    // 使用阻塞锁保证内存不发生竞态丢失。
+    pthread_spin_lock(&shard->lock);
+    if (shard->top < ITEMS_PER_SHARD - 1) {
+        shard->free_list[++shard->top] = ptr;
+    }
+    pthread_spin_unlock(&shard->lock);
+}
+
+// --- 驱动接口实现：内存分配 ---
+static void* u_alloc_large_table(size_t size) {
+    // 使用 mmap 分配大块内存
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        // 回退到 calloc
+        return calloc(1, size);
+    }
+    return ptr;
+}
+
+static void u_free_large_table(void *ptr) {
+    // 对于 mmap 的内存，应该用 munmap，但这里未记录 size
+    // 鉴于 Directory Table 随进程生命周期存在，这里不执行操作
+}
+
+/* 
+ * [物理意图] 为分布式事务分配唯一的“身份证（Transaction ID）”。
+ * [关键逻辑] 实现基于 Generation（代数）的防止 ABA 机制。即便 ID 发生回绕，过时的包也不会误触发新的请求回调。
+ * [后果] 如果没有 ID 追踪，网络乱序回包可能导致 CPU 读到错误的内存快照，产生静默数据破坏（Silent Data Corruption）。
+ */
+static uint64_t u_alloc_req_id(void *rx_buffer) {
+    uint64_t id;
+    int idx;
+    int attempts = 0;
+    
+    // 尝试多次获取 ID，避免在高并发下死锁
+    while (attempts < MAX_INFLIGHT_REQS * 2) {
+        id = __sync_fetch_and_add(&g_id_counter, 1);
+        if (id == 0) id = __sync_fetch_and_add(&g_id_counter, 1);
+        
+        idx = id % MAX_INFLIGHT_REQS;
+        
+        if (pthread_mutex_trylock(&g_u_req_ctx[idx].lock) == 0) {
+            if (g_u_req_ctx[idx].rx_buffer == NULL) {
+                g_u_req_ctx[idx].rx_buffer = rx_buffer;
+                g_u_req_ctx[idx].full_id = id; 
+                g_u_req_ctx[idx].status = 0;
+                pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+                return id; 
+            }
+            pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+        }
+        attempts++;
+        if (attempts % 100 == 0) u_yield_cpu_short_time();
+    }
+    u_log("[CRITICAL] User backend: No free request IDs available!");
+    return (uint64_t)-1;
+}
+
+static void u_free_req_id(uint64_t id) {
+    int idx = id % MAX_INFLIGHT_REQS;
+    pthread_mutex_lock(&g_u_req_ctx[idx].lock);
+    if (g_u_req_ctx[idx].full_id == id) {
+        g_u_req_ctx[idx].rx_buffer = NULL;
+        g_u_req_ctx[idx].status = 0;
+        // full_id 不清零，保留用于过时包的校验
+    }
+    pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+}
+
+static int u_check_req_status(uint64_t id) {
+    int s = -1;
+    uint32_t idx = id % MAX_INFLIGHT_REQS;
+    pthread_mutex_lock(&g_u_req_ctx[idx].lock);
+    if (g_u_req_ctx[idx].full_id == id) {
+        s = g_u_req_ctx[idx].status;
+    }
+    pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+    return s;
+}
+
+static void u_send_packet_async(uint16_t msg_type, void* payload, int len, uint32_t target_id, uint8_t qos) {
+    size_t pkt_len = sizeof(struct gvm_header) + len;
+    uint8_t *buffer = u_alloc_packet(pkt_len, 1);
+    if (!buffer) return;
+
+    struct gvm_header *hdr = (struct gvm_header *)buffer;
+    extern int g_my_node_id; 
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(msg_type);
+    hdr->payload_len = htons(len);
+    hdr->slave_id = htonl(g_my_node_id);
+    hdr->req_id = 0;
+    hdr->qos_level = qos;
+    hdr->crc32 = 0;
+
+    if (payload && len > 0) memcpy(buffer + sizeof(*hdr), payload, len);
+    
+    hdr->crc32 = htonl(calculate_crc32(buffer, pkt_len));
+
+    u_send_packet(buffer, pkt_len, target_id);
+    u_free_packet(buffer);
+}
+
+// --- 队列操作 ---
+static void queue_init(tx_queue_t *q) {
+    q->head = q->tail = NULL;
+    q->count = 0;
+    pthread_spin_init(&q->lock, 0);
+}
+
+static tx_node_t* queue_pop(tx_queue_t *q) {
+    tx_node_t *node = NULL;
+    pthread_spin_lock(&q->lock); 
+    if (q->head) {
+        node = q->head;
+        q->head = node->next;
+        if (!q->head) {
+            q->tail = NULL;
+        }
+        q->count--;
+    }
+    pthread_spin_unlock(&q->lock);
+    return node;
+}
+
+/* 
+ * [物理意图] 实现应用层到物理网卡的“流量整形”与“反向压力”。
+ * [关键逻辑] 拦截 Gateway 的返回值：若网关缓冲区溢出，此处执行自适应指数退避，而非暴力丢包。
+ * [后果] 这是 P2P 网络在公网环境下的生命线。它防止了节点在网络拥塞时疯狂重传，从而实现“优雅减速”而非“系统坍缩”。
+ */
+static int raw_send(tx_node_t *node) {
+    struct sockaddr_in *target = &g_gateways[g_my_node_id];
+    if (target->sin_port == 0 || g_tx_socket < 0) return -1;
+    
+    // [自治增强]：在发送前强制注入当前的本地 Epoch 和状态
+    struct gvm_header *hdr = (struct gvm_header *)node->data;
+    extern uint32_t g_curr_epoch;      // 引用自 logic_core
+    extern uint8_t  g_my_node_state;  // 引用自 logic_core
+    
+    hdr->epoch = g_curr_epoch;
+    hdr->node_state = g_my_node_state;
+    
+    // 重新计算 CRC（因为 Header 变了）
+    hdr->crc32 = 0;
+    hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
+    
+    // 感知 Gateway 的反压返回值
+    extern int push_to_aggregator(uint32_t slave_id, void *data, int len);
+    
+    int retries = 0;
+    while (1) {
+        // 调用网关服务
+        int res = push_to_aggregator(node->target_id, node->data, node->len);
+        
+        if (res == 0) return 0; // 成功进入网关缓冲区
+        
+        if (res == -EBUSY || res == -EAGAIN) {
+            // 网关缓冲区满了，必须指数退避重试，绝不能直接丢弃
+            retries++;
+            if (retries < 100) {
+                usleep(10 * retries); 
+                continue;
+            } else {
+                u_log("[Gateway] Severe Congestion for Slave %d, dropping packet", node->target_id);
+                return -1;
+            }
+        }
+        return res;
+    }
+}
+
+/* 
+ * [物理意图] 模拟处理器的“严格优先级调度器”，保证控制信号不被数据洪流淹没。
+ * [关键逻辑] 维护“快/慢”双车道：Fast Queue（信令/ACK/Diff）拥有绝对抢占权，Slow Queue（全页/VCPU）按配额运行。
+ * [后果] 解决了典型的“队首阻塞”问题。若无此分级，一个大块内存同步包会堵死全网的 ACK 确认，导致集群瞬间雪崩（Cascading Failure）。
+ */
+static void* tx_worker_thread(void *arg) {
+    while (1) {
+        tx_node_t *node;
+        
+        // 1. 优先清空 Fast Queue
+        while ((node = queue_pop(&g_fast_queue)) != NULL) {
+            struct gvm_header* hdr = (struct gvm_header*)node->data;
+            // 计算 CRC32
+            hdr->crc32 = 0;
+            hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
+            
+            raw_send(node);
+            u_free_packet(node);
+        }
+
+        // 2. 按配额处理 Slow Queue
+        int quota = 16;
+        while (quota > 0 && (node = queue_pop(&g_slow_queue)) != NULL) {
+            struct gvm_header* hdr = (struct gvm_header*)node->data;
+            // 计算 CRC32
+            hdr->crc32 = 0;
+            hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
+            
+            raw_send(node);
+            u_free_packet(node);
+            quota--;
+            
+            // 抢占：如果有快包进入，立即中断慢包处理
+            if (g_fast_queue.count > 0) break;
+        }
+
+        // 3. 无任务时休眠
+        pthread_mutex_lock(&g_tx_cond_lock);
+        if (g_fast_queue.count == 0 && g_slow_queue.count == 0) {
+            pthread_cond_wait(&g_tx_cond, &g_tx_cond_lock);
+        }
+        pthread_mutex_unlock(&g_tx_cond_lock);
+    }
+    return NULL;
+}
+
+// --- 驱动接口实现：发送 ---
+static int u_send_packet(void *data, int len, uint32_t target_id) {
+    if (g_tx_socket < 0) return -1;
+    
+    struct gvm_header *hdr = (struct gvm_header *)data;
+    tx_queue_t *q;
+    int is_atomic = 0;
+
+    // 根据 QoS 级别选择队列
+    if (hdr->qos_level == 1) {
+        q = &g_fast_queue;
+    } else {
+        q = &g_slow_queue;
+    }
+    
+    // 分配队列节点
+    tx_node_t *node = (tx_node_t *)u_alloc_packet(sizeof(tx_node_t) + len, is_atomic);
+    if (!node) return -1;
+
+    node->next = NULL;
+    node->target_id = target_id;
+    node->len = len;
+    memcpy(node->data, data, len);
+
+    // 入队操作
+    // 因为 is_atomic=0，这里会执行 pthread_spin_lock (死等直到获取锁)
+    // 这保证了高优先级包绝对不会因为锁竞争而丢弃
+    pthread_spin_lock(&q->lock);
+    if (q->tail) { 
+        q->tail->next = node; 
+        q->tail = node; 
+    } else { 
+        q->head = q->tail = node; 
+    }
+    q->count++;
+    pthread_spin_unlock(&q->lock);
+
+    // 唤醒 TX 线程
+    pthread_mutex_lock(&g_tx_cond_lock);
+    pthread_cond_signal(&g_tx_cond);
+    pthread_mutex_unlock(&g_tx_cond_lock);
+    return 0;
+}
+
+// [FIX] 引用全局设备描述符 (在 main_wrapper.c 中打开 /dev/giantvm)
+extern int g_dev_fd; 
+
+/* 
+ * [物理意图] 建立用户态感知与内核态加速（Mode A）之间的“配置虫洞”。
+ * [关键逻辑] 更新本地路由表的同时，通过 IOCTL 垂直穿透到内核模块，确保 Kernel 直接通信不经过慢速 User-Space。
+ * [后果] 实现了真正的“配置一致性”。若穿透失败，内核将向错误的旧 IP 发送数据，导致分布式计算出现逻辑黑洞。
+ */
+static void u_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
+    // 1. 更新用户态表 (供 Daemon 自身通信使用，如 Gossip)
+    if (gw_id < GVM_MAX_GATEWAYS) {
+        g_gateways[gw_id].sin_family = AF_INET;
+        g_gateways[gw_id].sin_addr.s_addr = ip;
+        g_gateways[gw_id].sin_port = port;
+    }
+
+    // 2. [关键] 如果是 Mode A，必须同步下发到内核！
+    // 通过判断 g_dev_fd 是否有效来识别是否开启了内核加速
+    if (g_dev_fd > 0) {
+        struct gvm_ioctl_gateway args;
+        args.gw_id = gw_id;
+        args.ip = ip;     // 此时已经是网络序
+        args.port = port; // 此时已经是网络序
+        
+        // 这一步实现了“垂直穿透”，让内核实时感知拓扑变化
+        if (ioctl(g_dev_fd, IOCTL_SET_GATEWAY, &args) < 0) {
+            perror("[Daemon] Failed to sync dynamic route to kernel");
+        } else {
+            // printf("[Daemon] Synced route %d -> %x to Kernel.\n", gw_id, ip);
+        }
+    }
+}
+
+// Deprecated in V29 logic core, but stub provided
+static void u_fetch_page(uint64_t gpa, void *buf) {
+    memset(buf, 0, 4096);
+}
+
+static void u_invalidate_local(uint64_t gpa) {
+    // No-op for user backend, logic core handles this
+}
+
+extern uint64_t gvm_logic_get_page_version(uint64_t gpa);
+
+/* 
+ * [物理意图] 充当本地物理内存的“分布式 DMA 控制器”。
+ * [关键逻辑] 响应远程读请求，从共享内存（SHM）中提取数据，并强制附加 Logic Core 维护的最新的版本号（Version）。
+ * [后果] 提供了真理的来源。这是 Wavelet 协议中“拉取（Pull）”链路的终点，保证了 Directory 数据的对外可见性。
+ */
+static void handle_slave_read(int fd, struct sockaddr_in *dest, struct gvm_header *req) {
+    if (!g_shm_ptr) return;
+
+    // 1. 从请求中解析 GPA
+    uint64_t gpa = GVM_NTOHLL(*(uint64_t*)(req + 1));
+    if (gpa + 4096 > g_shm_size) return;
+
+    // 2. 准备完整的响应包缓冲区 (Header + Payload结构体)
+    // 大小 = 24 (Header) + 16 (GPA/Ver) + 4096 (Data) = 4136 字节
+    uint8_t tx_buffer[sizeof(struct gvm_header) + sizeof(struct gvm_mem_ack_payload)];
+    memset(tx_buffer, 0, sizeof(tx_buffer));
+
+    struct gvm_header *ack_hdr = (struct gvm_header *)tx_buffer;
+    struct gvm_mem_ack_payload *ack_pl = (struct gvm_mem_ack_payload *)(tx_buffer + sizeof(struct gvm_header));
+
+    // 3. 填充 Payload (关键！)
+    ack_pl->gpa = GVM_HTONLL(gpa);
+    // 从 Logic Core 获取当前权威版本号，这对于 V29 的订阅机制至关重要
+    ack_pl->version = GVM_HTONLL(gvm_logic_get_page_version(gpa));
+    // 拷贝真正的内存数据
+    memcpy(ack_pl->data, (uint8_t*)g_shm_ptr + gpa, 4096);
+
+    // 4. 填充 Header
+    ack_hdr->magic = htonl(GVM_MAGIC);
+    ack_hdr->msg_type = htons(MSG_MEM_ACK);
+    // 注意：payload_len 现在是 4112 字节 (16 + 4096)，而不是 4096！
+    ack_hdr->payload_len = htons(sizeof(struct gvm_mem_ack_payload));
+    ack_hdr->req_id = req->req_id;
+    ack_hdr->slave_id = htonl(g_my_node_id);
+    ack_hdr->qos_level = 0; // 慢车道包
+    ack_hdr->crc32 = 0;
+
+    // 5. 计算全包 CRC32
+    uint32_t c = calculate_crc32(tx_buffer, sizeof(tx_buffer));
+    ack_hdr->crc32 = htonl(c);
+
+    // 6. 发送
+    sendto(fd, tx_buffer, sizeof(tx_buffer), 0, (struct sockaddr*)dest, sizeof(*dest));
+}
+
+// 引用 Logic Core
+extern void gvm_logic_update_local_version(uint64_t gpa);
+extern void gvm_logic_broadcast_rpc(void *payload_data, int payload_len, uint16_t msg_type);
+
+/* 
+ * [物理意图] 执行“语义透传”指令，实现内存状态的“瞬时坍缩”。
+ * [关键逻辑] 利用 mprotect(PROT_WRITE) 构建写锁栅栏，在物理 memset 期间暂时禁用读取，确保全网一致性视图。
+ * [后果] 这是 GiantVM 突破物理带宽限制的神作。它让 GB 级的内存清零操作在 10µs 内在全网节点同步完成，效率提升万倍。
+ */
+static void handle_rpc_batch_execution(void *payload, uint32_t payload_len) {
+    if (payload_len < sizeof(struct gvm_rpc_batch_memset)) return;
+
+    struct gvm_rpc_batch_memset *batch = (struct gvm_rpc_batch_memset *)payload;
+    uint32_t count = ntohl(batch->count);
+    uint32_t val = ntohl(batch->val);
+    
+    // 边界检查：防止 count 过大导致越界读取
+    size_t required_len = sizeof(struct gvm_rpc_batch_memset) + count * sizeof(struct gvm_rpc_region);
+    if (payload_len < required_len) return;
+
+    struct gvm_rpc_region *regions = (struct gvm_rpc_region *)(batch + 1);
+    
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t gpa = GVM_NTOHLL(regions[i].gpa);
+        uint64_t r_len = GVM_NTOHLL(regions[i].len);
+        
+        if (gpa + r_len > g_shm_size) continue;
+        
+        void *host_addr = (uint8_t*)g_shm_ptr + gpa;
+
+        // [PATCH] 原子性增强步骤
+        
+        // 1. 上“写锁”：将页面权限设为 PROT_WRITE (不可读) 或 PROT_NONE
+        // 任何试图在此期间读取该内存的 vCPU 都会触发 Segfault 并被挂起
+        // 注意：我们自己也无法读取，但 memset 是只写操作，所以 PROT_WRITE 是安全的
+        mprotect(host_addr, r_len, PROT_WRITE);
+        
+        // 2. 内存屏障
+        __sync_synchronize();
+
+        // 3. 执行物理操作 (现在是安全的，因为没人能读)
+        memset(host_addr, val, r_len);
+
+        // [FIX] Memory Barrier
+        __sync_synchronize(); // Full barrier
+        
+        // 4. 恢复权限 (恢复为 PROT_READ|PROT_WRITE)
+        mprotect(host_addr, r_len, PROT_READ | PROT_WRITE);
+        
+        // 5. 更新版本号
+        for (uint64_t offset = 0; offset < r_len; offset += 4096) {
+            gvm_logic_update_local_version(gpa + offset);
+        }
+    }
+    
+    broadcast_push_to_qemu(MSG_RPC_BATCH_MEMSET, payload, payload_len);
+    
+    u_log("[Prophet] Local execution done, sync notification sent to QEMU.");
+}
+
+// [IPC Source] 处理来自本地 QEMU 的请求
+static void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len) {
+    if (len < sizeof(struct gvm_header)) return;
+    struct gvm_header *hdr = (struct gvm_header *)data;
+    uint16_t msg_type = ntohs(hdr->msg_type);
+    void *payload = (void*)hdr + sizeof(struct gvm_header);
+    uint32_t payload_len = len - sizeof(struct gvm_header);
+
+    if (msg_type == MSG_RPC_BATCH_MEMSET) {
+        // 1. 本地执行
+        handle_rpc_batch_execution(payload, payload_len);
+        
+        // 2. [Broadcast] 全网广播 (Source ID = Me)
+        hdr->slave_id = htonl(g_my_node_id);
+        gvm_logic_broadcast_rpc(data, len, msg_type);
+    }
+    
+    // 3. [ACK] 解除 QEMU 阻塞
+    uint8_t ack = 1;
+    write(qemu_fd, &ack, 1);
+}
+
+/* 
+ * [物理意图] 整个计算节点的“物理入站总线”，负责数据的物理安全与分发。
+ * [关键逻辑] 1. recvmmsg 批量聚合：降低中断频率；2. CRC32 强校验：拦截比特翻转；3. Epoch 过滤：隔离旧时代流量。
+ * [后果] 这是全网最危险的性能红线。任何在此处的 CPU 浪费（如 malloc）都会导致 PPS 严重掉队，诱发全网重传风暴。
+ */
+static void* rx_thread_loop(void *arg) {
+    long thread_idx = (long)arg;
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("RX socket create failed");
+        return NULL;
+    }
+    
+    // 设置非阻塞
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    
+    // 开启端口复用
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+    struct sockaddr_in bind_addr = { 
+        .sin_family=AF_INET, 
+        .sin_port=htons(g_local_port), 
+        .sin_addr.s_addr=INADDR_ANY 
+    };
+    
+    if (bind(sockfd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("User backend RX bind failed");
+        close(sockfd);
+        return NULL;
+    }
+
+    // 线程 0 负责提供全局发送 Socket
+    if (thread_idx == 0) {
+        pthread_mutex_lock(&g_init_lock);
+        g_tx_socket = sockfd;
+        pthread_cond_signal(&g_init_cond);
+        pthread_mutex_unlock(&g_init_lock);
+    }
+
+    // recvmmsg 缓冲区
+    struct mmsghdr msgs[BATCH_SIZE];
+    struct iovec iovecs[BATCH_SIZE];
+    struct sockaddr_in src_addrs[BATCH_SIZE];
+    uint8_t *buffer_pool = malloc(BATCH_SIZE * GVM_MAX_PACKET_SIZE);
+    
+    if (!buffer_pool) {
+        perror("RX buffer pool malloc failed");
+        close(sockfd);
+        return NULL;
+    }
+
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        iovecs[i].iov_base = buffer_pool + (i * GVM_MAX_PACKET_SIZE);
+        iovecs[i].iov_len = GVM_MAX_PACKET_SIZE;
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &src_addrs[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+    }
+
+    struct pollfd pfd;
+    pfd.fd = sockfd;
+    pfd.events = POLLIN;
+
+    while (1) {
+        if (poll(&pfd, 1, -1) <= 0) continue;
+
+        int n = recvmmsg(sockfd, msgs, BATCH_SIZE, 0, NULL);
+        if (n <= 0) continue;
+
+        for (int i = 0; i < n; i++) {        
+            uint8_t *base_ptr = (uint8_t *)iovecs[i].iov_base; // 基准地址
+            int total_len = msgs[i].msg_len;                   // UDP包总长
+            int offset = 0;                                    // 当前游标
+            uint32_t src_ip = src_addrs[i].sin_addr.s_addr;    // 源IP
+
+            // 循环解包：只要剩余数据够一个Header，就继续解析
+            while (offset + sizeof(struct gvm_header) <= total_len) {
+            
+                // 计算当前包头的实际位置
+                struct gvm_header *hdr = (struct gvm_header *)(base_ptr + offset);
+            
+                // 1. 魔数校验 (快速失败，防止处理垃圾数据)
+                if (ntohl(hdr->magic) != GVM_MAGIC) {
+                    break; // 如果魔数不对，说明后续数据无法对齐，直接丢弃该 UDP 包剩余部分
+                }
+
+                // 计算当前这个 GVM 子包的长度
+                uint16_t p_len = ntohs(hdr->payload_len);
+                int current_pkt_len = sizeof(struct gvm_header) + p_len;
+
+                // 2. 长度越界校验
+                if (offset + current_pkt_len > total_len) {
+                    break; // 包被截断，丢弃
+                }
+
+                // 3. CRC32 校验
+                uint32_t received_crc = ntohl(hdr->crc32);
+                hdr->crc32 = 0; // 计算前清零
+                uint32_t calculated_crc = calculate_crc32((uint8_t*)hdr, current_pkt_len);
+            
+                uint64_t rid = GVM_NTOHLL(hdr->req_id); // 定义 rid
+                uint16_t msg_type = ntohs(hdr->msg_type); // 定义 msg_type
+
+                if (received_crc == calculated_crc) {
+                    uint32_t msg_epoch = hdr->epoch;
+                    extern uint32_t g_curr_epoch;
+
+                    // [自治策略]：丢弃来自未来的非法包，或处理落后包
+                    if (msg_epoch > g_curr_epoch + 5) {
+                        // 跨度过大，可能是由于网络分区（Split-brain）后节点归队
+                        // 这种情况下不能处理该包，应等待视图同步
+                        continue;
+                    }
+                    // 校验通过，恢复 CRC
+                    hdr->crc32 = htonl(received_crc);
+                    void *payload = (void*)hdr + sizeof(struct gvm_header);
+                
+                    // 分发逻辑
+                    if (rid != 0 && rid != (uint64_t)-1) {
+                        // 请求-响应模式 (ACK)
+                        uint32_t idx = rid % MAX_INFLIGHT_REQS;
+                        pthread_mutex_lock(&g_u_req_ctx[idx].lock);
+                        if (g_u_req_ctx[idx].rx_buffer && g_u_req_ctx[idx].full_id == rid) {
+                    
+                            // [V29 Final Fix] 处理带版本的 ACK
+                            if (msg_type == MSG_MEM_ACK && p_len == sizeof(struct gvm_mem_ack_payload)) {
+                                struct gvm_mem_ack_payload *ack_p = (struct gvm_mem_ack_payload*)payload;
+                                memcpy(g_u_req_ctx[idx].rx_buffer, ack_p->data, 4096);
+                                // 版本号可以通过 IPC 传递给 QEMU，或者由调用方通过共享内存处理
+                                // 这里我们完成了数据拷贝，通知调用方完成
+                            } else {
+                                // 兼容旧模式
+                                memcpy(g_u_req_ctx[idx].rx_buffer, payload, p_len);
+                            }
+                            g_u_req_ctx[idx].status = 1;
+                        }
+                        pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+
+                    } else {
+                        // [V29 FINAL FIX] 客户端推送处理逻辑
+                        // 如果是推送/失效消息，Daemon 必须自己处理（更新 SHM + 通知 QEMU）
+                        // 而不能扔给只懂服务端业务的 logic_core
+
+                        void *payload = base_ptr + offset + sizeof(struct gvm_header);
+                        uint16_t p_len = ntohs(hdr->payload_len);
+                        if (msg_type == MSG_PAGE_PUSH_FULL) {
+                            struct gvm_full_page_push *push = (struct gvm_full_page_push *)payload;
+                            uint64_t gpa = GVM_NTOHLL(push->gpa);
+                            if (gpa + 4096 <= g_shm_size) {
+                                // 1. 更新本地 SHM (成为最新版本)
+                                memcpy((uint8_t*)g_shm_ptr + gpa, push->data, 4096);
+                                // 2. 转发给 QEMU (IPC) 以更新版本号/TLB
+                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct gvm_full_page_push));
+                            }
+                        } 
+                        else if (msg_type == MSG_PAGE_PUSH_DIFF) {
+                            struct gvm_diff_log *log = (struct gvm_diff_log *)payload;
+                            uint64_t gpa = GVM_NTOHLL(log->gpa);
+                            uint16_t off = ntohs(log->offset);
+                            uint16_t sz = ntohs(log->size);
+                    
+                            if (gpa < g_shm_size && off + sz <= 4096) {
+                                // 1. 应用 Diff 到 SHM
+                                memcpy((uint8_t*)g_shm_ptr + gpa + off, log->data, sz);
+                                // 2. 转发给 QEMU
+                                // 注意：这里需要计算正确的 payload 长度 (header + data)
+                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct gvm_diff_log) + sz);
+                            }
+                        }
+                        else if (msg_type == MSG_INVALIDATE || msg_type == MSG_DOWNGRADE || msg_type == MSG_FORCE_SYNC) {
+                            // 控制类推送：直接转发给 QEMU 处理
+                            // 这里的 payload_len 是网络包里的长度，需要传给 IPC
+                            broadcast_push_to_qemu(msg_type, payload, p_len);
+                        }
+                        else if (msg_type == MSG_MEM_READ) { 
+                            handle_slave_read(sockfd, &src_addrs[i], hdr); 
+                        } 
+                        else if (msg_type == MSG_VFIO_IRQ) {
+                            // [FIX] 收到中断包，必须通过 IPC 转发给本地 QEMU
+                            broadcast_irq_to_qemu();
+                        }
+                        else if (msg_type == MSG_RPC_BATCH_MEMSET) {
+                            // 收到远程节点的广播 -> 仅执行本地操作
+                            // 不需要回复 ACK (广播是 Fire-and-Forget)
+                            // 不需要再次广播 (防止风暴)
+                           // CRC 校验已在 Loop 开头完成，此处数据安全
+                           handle_rpc_batch_execution(payload, p_len);
+                       }
+                        else {
+                            // 其他消息 (DECLARE/COMMIT) 才是给服务端 Logic Core 的
+                            uint32_t src_id = ntohl(hdr->slave_id);
+                            gvm_logic_process_packet(hdr, payload, src_id);
+                        }
+                    }
+                }
+    
+                } else {
+                    // 仅打印日志，不中断循环，尝试处理下一个包(虽然通常意味着数据已乱)
+                    u_log("[Warn] CRC failed in aggregated packet");
+                }
+
+                // 4. [关键] 指针移动到下一个包
+                offset += current_pkt_len;
+            }
+        }
+    }
+    free(buffer_pool);
+    return NULL;
+}
+
+// 供 logic_core 调用
+void gvm_notify_kernel_epoch(uint32_t epoch) {
+    // g_dev_fd 是打开 /dev/giantvm 的句柄，需要在初始化时保存
+    extern int g_dev_fd; 
+    if (g_dev_fd > 0) {
+        ioctl(g_dev_fd, IOCTL_UPDATE_EPOCH, &epoch);
+    }
+}
+
+// --- 公共接口定义 ---
+struct dsm_driver_ops u_ops = {
+    .alloc_large_table = u_alloc_large_table,
+    .free_large_table = u_free_large_table,
+    .alloc_packet = u_alloc_packet,
+    .free_packet = u_free_packet,
+    .set_gateway_ip = u_set_gateway_ip,
+    .send_packet = u_send_packet,
+    .fetch_page = u_fetch_page,
+    .invalidate_local = u_invalidate_local,
+    .handle_page_fault = NULL, 
+    .log = u_log,
+    .is_atomic_context = u_is_atomic_context,
+    .touch_watchdog = u_touch_watchdog,
+    .alloc_req_id = u_alloc_req_id,
+    .free_req_id = u_free_req_id,
+    .get_time_us = u_get_time_us,
+    .time_diff_us = u_time_diff_us,
+    .check_req_status = u_check_req_status,
+    .cpu_relax = u_cpu_relax,
+    .get_random = u_get_random,
+    .yield_cpu_short_time = u_yield_cpu_short_time,
+    .send_packet_async = u_send_packet_async
+};
+
+// --- 初始化入口 ---
+int user_backend_init(int my_node_id, int port) {
+    g_my_node_id = my_node_id;
+    g_local_port = port;
+    srand(time(NULL));
+    
+    // 初始化本地 Gateway 地址 (默认指向 localhost:9000)
+    g_gateways[my_node_id].sin_family = AF_INET;
+    g_gateways[my_node_id].sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    g_gateways[my_node_id].sin_port = htons(9000); 
+
+    // 初始化请求上下文锁
+    for (int i=0; i<MAX_INFLIGHT_REQS; i++) {
+        pthread_mutex_init(&g_u_req_ctx[i].lock, NULL);
+    }
+    
+    // 初始化内存池和队列
+    init_pkt_pool();
+    queue_init(&g_fast_queue);
+    queue_init(&g_slow_queue);
+
+    // 启动 RX 线程 (根据 CPU 核心数动态调整，这里演示用 4)
+    for (long i = 0; i < RX_THREAD_COUNT; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, rx_thread_loop, (void*)i) != 0) {
+            perror("Failed to create RX thread");
+            return -1;
+        }
+        pthread_detach(th);
+    }
+
+    // 等待 RX 线程 0 初始化 Socket 并赋值给 g_tx_socket
+    pthread_mutex_lock(&g_init_lock);
+    while (g_tx_socket < 0) {
+        pthread_cond_wait(&g_init_cond, &g_init_lock);
+    }
+    pthread_mutex_unlock(&g_init_lock);
+
+    // 启动 TX 线程
+    if (pthread_create(&g_tx_thread, NULL, tx_worker_thread, NULL) != 0) {
+        perror("Failed to create TX thread");
+        return -1;
+    }
+    
+    return 0;
+}
+

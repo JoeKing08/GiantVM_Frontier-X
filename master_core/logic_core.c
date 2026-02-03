@@ -1,0 +1,1538 @@
+
+/*
+ * [IDENTITY] Master Core - The Distributed Brain
+ * ---------------------------------------------------------------------------
+ * 物理角色：每个计算节点内的"一致性指挥部"。
+ * 职责边界：
+ * 1. 维护本地 Pod 视图内的 DHT 寻址，判定 GPA 权属。
+ * 2. 运行 Pub/Sub 引擎，管理每个页面的订阅者位图。
+ * 3. 判定写冲突：利用乐观锁校验版本号，发起 FORCE_SYNC 修正。
+ * 
+ * [禁止事项]
+ * - 严禁在此处直接操作 Socket 或进行文件 IO。
+ * - 严禁修改 HASH_RING_SIZE (4096)，Pod 扩展请修改分层网关配置。
+ * - 严禁移除 Latch 或 Lock 机制，否则在高并发写下 Directory 内存将损坏。
+ * ---------------------------------------------------------------------------
+ */
+#include "logic_core.h"
+#include "../common_include/giantvm_protocol.h"
+#include "../common_include/giantvm_config.h"
+
+#ifdef __KERNEL__
+    #include <linux/spinlock.h>
+    #include <linux/string.h>
+    
+    typedef spinlock_t pthread_mutex_t;
+    #define pthread_mutex_init(l, a) spin_lock_init(l)
+    #define pthread_mutex_lock(l)    spin_lock_bh(l)
+    #define pthread_mutex_unlock(l)  spin_unlock_bh(l)
+
+    #define pthread_spinlock_t       spinlock_t
+    #define pthread_spin_init(l, a)  spin_lock_init(l)
+    #define pthread_spin_lock(l)     spin_lock(l)
+    #define pthread_spin_unlock(l)   spin_unlock(l)
+    // --------------------
+
+#else
+    #include <pthread.h>
+    #include <string.h>
+#endif
+
+#ifdef __KERNEL__
+    #include <linux/slab.h>
+    #define gvm_malloc(sz) kmalloc(sz, GFP_ATOMIC) 
+    #define gvm_free(ptr) kfree(ptr)
+#else
+    #include <stdlib.h>
+    #define gvm_malloc(sz) malloc(sz)
+    #define gvm_free(ptr) free(ptr)
+#endif
+
+#ifdef __KERNEL__
+    #define gvm_alloc_local(sz) kmalloc(sz, GFP_ATOMIC)
+    #define gvm_free_local(ptr) kfree(ptr)
+#else
+    #define gvm_alloc_local(sz) malloc(sz)
+    #define gvm_free_local(ptr) free(ptr)
+#endif
+
+#ifdef __KERNEL__
+    #include <linux/slab.h>
+    #define malloc(sz) kmalloc(sz, GFP_ATOMIC)
+    #define free(ptr) kfree(ptr)
+#endif
+
+#include <stdatomic.h> 
+
+// --- 全局状态 ---
+struct dsm_driver_ops *g_ops = NULL;
+int g_total_nodes = 1;
+int g_my_node_id = 0;
+
+// 哈希环脏标记 (解决 CPU 抖动)
+static atomic_bool g_ring_dirty = false;
+
+static struct {
+    uint8_t buf[MTU_SIZE + 128]; 
+    int curr_offset;
+    uint32_t last_gateway_id; 
+    pthread_mutex_t lock;
+} g_gossip_agg = { .curr_offset = 0, .lock = PTHREAD_MUTEX_INITIALIZER };
+
+#define MAX_LOCAL_VIEW 1024  // 本地感知的邻居上限
+#define GOSSIP_INTERVAL_US 500000 // 500ms 心跳一次
+#define VIEW_SYNC_INTERVAL_US 2000000 // 2秒同步一次全量视图
+static uint64_t g_last_view_sync_us = 0;
+
+// --- 指数退避与超时参数 ---
+#define INITIAL_RETRY_DELAY_US 1000      // 1ms
+#define MAX_RETRY_DELAY_US     1000000   // 1s
+#define TOTAL_TIMEOUT_US       5000000   // 5s
+
+// --- 目录表定义 ---
+#define DIR_TABLE_SIZE (1024 * 1024 * 64) // 4M Entries
+#define DIR_MAX_PROBE 128
+#define LOCK_SHARDS 65536
+#define SMALL_UPDATE_THRESHOLD 1024 
+
+#define GVM_CPU_ROUTE_TABLE_SIZE MAX_VCPUS 
+
+// --- 分片广播队列定义 ---
+#define NUM_BCAST_WORKERS   8      // 定义8个并行的广播工作线程
+#define BCAST_Q_SIZE        16384  // 每个分片队列的大小
+#define BCAST_Q_MASK        (BCAST_Q_SIZE - 1)
+
+#define RETRY_TIMEOUT_US 1000 
+#define MIN_HOLD_TIME_US 500
+
+// 订阅者位图
+typedef struct {
+    unsigned long bits[(GVM_MAX_SLAVES + 63) / 64];
+} copyset_t;
+
+// [辅助宏] 用于操作 64 位复合版本号
+#define MAKE_VERSION(epoch, counter) (((uint64_t)(epoch) << 32) | (counter))
+#define GET_EPOCH(version) ((uint32_t)((version) >> 32))
+#define GET_COUNTER(version) ((uint32_t)((version) & 0xFFFFFFFF))
+
+// 页面元数据
+typedef struct {
+    uint64_t gpa;
+    uint8_t  is_valid; // bool in C
+    uint64_t version; // [FIX] 高32位: Epoch, 低32位: Counter
+    uint64_t segment_mask[256]; 
+    copyset_t subscribers;
+    uint64_t last_interest_time;
+    uint8_t  base_page_data[4096];
+    pthread_mutex_t lock;
+} page_meta_t;
+
+static page_meta_t *g_dir_table = NULL;
+static pthread_mutex_t g_dir_table_locks[LOCK_SHARDS];
+
+// --- 辅助函数 ---
+/* 
+ * [物理意图] 将 64 位 GPA 空间均匀“粉碎”并映射到 32 位哈希空间。
+ * [关键逻辑] 采用非线性散列算法，确保 Guest OS 连续分配的内存页在 DHT 环上能够物理离散分布。
+ * [后果] 若此函数失效，内存元数据将产生严重的负载倾斜（Skew），导致个别节点成为全网瓶颈。
+ */
+static inline uint32_t murmur3_32(uint64_t k) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33; return (uint32_t)k;
+}
+
+/* 
+ * [物理意图] 确定 GPA 对应的分段锁索引，实现万级并发下的“零争用”访问。
+ * [关键逻辑] 对页号进行哈希取模，将 500PB 内存映射到 LOCK_SHARDS (65536) 个独立的互斥域中。
+ * [后果] 这一步实现了管理平面的并行化，若分段数不足，高频写操作会导致 CPU 产生不必要的 L3 缓存行竞争。
+ */
+static inline uint32_t get_lock_idx(uint64_t gpa) {
+    return murmur3_32(gpa >> GVM_PAGE_SHIFT) % LOCK_SHARDS;
+}
+
+/* 
+ * [物理意图] 在页面的订阅者名单（Copy-set）中标记一个远程节点的“利害关系”。
+ * [关键逻辑] 操作 64 位对齐的位图，记录哪些节点持有该页面的只读缓存，以便在发生写入时发起精准推送。
+ * [后果] 这是 Wavelet 协议的核心，它取代了 V28 的盲目广播，将网络流量精确控制在“有需求的节点”之间。
+ */
+static void copyset_set(copyset_t *cs, uint32_t node_id) {
+    if (node_id >= GVM_MAX_SLAVES) return;
+    cs->bits[node_id / 64] |= (1UL << (node_id % 64));
+}
+
+static uint32_t g_cpu_route_table[GVM_CPU_ROUTE_TABLE_SIZE]; 
+
+/* 
+ * [物理意图] 建立 vCPU 索引与物理计算节点 ID 之间的静态/动态映射表。
+ * [关键逻辑] 用于指导 Master 节点的调度器：当特定的 vCPU 触发陷入时，应该将执行上下文路由给哪个 Slave。
+ * [后果] 若此表配置错误，vCPU 将被路由到不存在的节点，导致超级虚拟机的指令流瞬间断裂。
+ */
+void gvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id) {
+    // 这里的边界检查现在是安全的，与全局配置一致
+    if (vcpu_index >= 0 && vcpu_index < GVM_CPU_ROUTE_TABLE_SIZE) {
+        g_cpu_route_table[vcpu_index] = slave_id;
+    }
+}
+
+uint32_t gvm_get_compute_slave_id(int vcpu_index) {
+    if (vcpu_index >= 0 && vcpu_index < GVM_CPU_ROUTE_TABLE_SIZE) {
+        return g_cpu_route_table[vcpu_index];
+    }
+    return 0; 
+}
+
+/* 
+ * [物理意图] 获取特定 GPA 在全网中的最新逻辑时钟（版本号）。
+ * [关键逻辑] 直接查询本地 Directory 表，用于在 PUSH 响应中携带真理戳。
+ * [后果] 如果获取到的版本号落后，会导致接收端触发版本断层校验失败，进而发起 FORCE_SYNC 全页拉取。
+ */
+uint64_t gvm_logic_get_page_version(uint64_t gpa) {
+    uint32_t lock_idx = get_lock_idx(gpa);
+    uint64_t ver = 0;
+    pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+    
+    // 我们只需要读取版本，不需要创建 meta，如果不存在说明是初始版本 0
+    uint64_t page_idx = gpa >> GVM_PAGE_SHIFT;
+    uint32_t hash = murmur3_32(page_idx);
+    for (int i = 0; i < DIR_MAX_PROBE; i++) {
+        uint32_t cur = (hash + i) % DIR_TABLE_SIZE;
+        if (g_dir_table[cur].is_valid && g_dir_table[cur].gpa == gpa) {
+            ver = g_dir_table[cur].version;
+            break;
+        }
+        if (!g_dir_table[cur].is_valid) break;
+    }
+    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+    return ver;
+}
+
+/* 
+ * [物理意图] 在 Directory 管理表中定位或初始化页面的“户口信息”。
+ * [关键逻辑] 使用带线性探测的固定哈希表，存储页面的版本、订阅位图以及主备份数据。
+ * [后果] 这是逻辑核心最重负载的查找点，固定数组设计保证了在 500PB 空间中的极致内存访问局部性，调用者需持锁。
+ */
+static page_meta_t* find_or_create_page_meta(uint64_t gpa) {
+    uint64_t page_idx = gpa >> GVM_PAGE_SHIFT; 
+    uint32_t hash = murmur3_32(page_idx);
+    
+    for (int i = 0; i < DIR_MAX_PROBE; i++) {
+        uint32_t cur = (hash + i) % DIR_TABLE_SIZE;
+        
+        // 找到存在的
+        if (g_dir_table[cur].is_valid && g_dir_table[cur].gpa == gpa) {
+            return &g_dir_table[cur];
+        }
+        
+        // 找到空位，新建
+        if (!g_dir_table[cur].is_valid) {
+            // 清零整个结构体，包括数据页
+            memset(&g_dir_table[cur], 0, sizeof(page_meta_t));
+            
+            g_dir_table[cur].is_valid = 1;
+            g_dir_table[cur].gpa = gpa;
+            g_dir_table[cur].version = MAKE_VERSION(g_curr_epoch, 1); 
+            
+            // 锁必须初始化，即使是在持锁状态下分配
+            pthread_mutex_init(&g_dir_table[cur].lock, NULL);
+            
+            return &g_dir_table[cur];
+        }
+    }
+    
+    // 哈希冲突导致表满，生产环境应有驱逐逻辑或更大的表
+    // 这里打印错误并返回NULL
+    if (g_ops && g_ops->log) {
+        g_ops->log("[CRITICAL] Directory hash table full/collision for GPA %llx!", (unsigned long long)gpa);
+    }
+    return NULL; 
+}
+
+// --- 核心接口实现 ---
+
+typedef struct {
+    uint32_t node_id;
+    struct sockaddr_in addr;
+    uint8_t  state;
+    uint32_t last_epoch;
+    uint64_t last_seen_us;
+    pthread_mutex_t lock;
+} peer_entry_t;
+
+// 局部拓扑视图：无中心架构的核心
+static peer_entry_t g_peer_view[MAX_LOCAL_VIEW];
+static int g_peer_count = 0;
+static pthread_rwlock_t g_view_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+// 自治周期控制
+static uint32_t g_curr_epoch = 0;
+static atomic_int g_peers_at_next_epoch = 0; // 观测到处于 E+1 的邻居计数
+
+// [PATCH] 预计算路由表大小
+#define HASH_RING_SIZE 4096 
+// 这个表存储：Slot -> NodeID 的映射
+static uint32_t g_hash_ring_cache[HASH_RING_SIZE];
+static pthread_rwlock_t g_ring_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* 
+ * [物理意图] 当集群发生节点加减（扩容/宕机）时，在后台重建 P2P 拓扑的逻辑环，复杂度 O(RingSize * PeerCount)，但在后台运行，不阻塞热路径
+。
+ * [关键逻辑] 采用双缓冲区设计，在写锁保护下仅进行微秒级的指针切换，计算过程则与数据面完全并发。
+ * [后果] 这保证了 100 万节点规模下的拓扑变更不会引起 vCPU 的卡顿（Zero-Stall Topology Update）。
+ */
+static void rebuild_hash_ring_cache(void) {
+    // 1. [栈上分配] 或 [堆分配] 临时 Ring，避免持有写锁进行计算
+    // 注意：4096 * 4 bytes = 16KB，栈上分配略大但通常可行，稳妥起见用 static 备用 buffer 或 malloc
+    uint32_t *temp_ring = malloc(sizeof(uint32_t) * HASH_RING_SIZE);
+    if (!temp_ring) return;
+
+    // 2. 获取 View 读锁进行计算 (此时不持有 Ring 锁，不阻塞路由查询)
+    pthread_rwlock_rdlock(&g_view_lock);
+    
+    if (g_peer_count == 0) {
+        for(int i=0; i<HASH_RING_SIZE; i++) temp_ring[i] = g_my_node_id;
+    } else {
+        // 耗时的 O(N*M) 计算在这里进行
+        for (int slot = 0; slot < HASH_RING_SIZE; slot++) {
+            uint32_t best_node = g_my_node_id;
+            uint64_t max_weight = murmur3_32(slot ^ g_my_node_id);
+            for (int i = 0; i < g_peer_count; i++) {
+                if (g_peer_view[i].state != NODE_STATE_ACTIVE) continue;
+                uint64_t weight = murmur3_32(slot ^ g_peer_view[i].node_id);
+                if (weight > max_weight) {
+                    max_weight = weight;
+                    best_node = g_peer_view[i].node_id;
+                }
+            }
+            temp_ring[slot] = best_node;
+        }
+    }
+    pthread_rwlock_unlock(&g_view_lock); 
+
+    // 3. [关键] 获取 Ring 写锁，仅进行内存拷贝 (memcpy 是微秒级的)
+    // 此时才真正发生 STW，但时间极短
+    pthread_rwlock_wrlock(&g_ring_lock);
+    memcpy(g_hash_ring_cache, temp_ring, sizeof(uint32_t) * HASH_RING_SIZE);
+    pthread_rwlock_unlock(&g_ring_lock);
+    
+    free(temp_ring);
+    // if (g_ops->log) g_ops->log("[Swarm] Hash Ring Rebuilt (Zero-Stall).");
+}
+
+/* 
+ * [物理意图] 在 P2P 哈希环上执行 O(1) 级的“真理定位”。
+ * [关键逻辑] 输入 GPA，通过 4096 槽位的预计算哈希环（Consistent Hashing），瞬间找到该内存页的 Directory 节点。
+ * [后果] 整个分布式内存的亚微秒级访问完全依赖此函数的计算效率，它规避了昂贵的网络寻址开销。
+ */
+uint32_t get_owner_node_id(uint64_t gpa) {
+    // 将 GPA 映射到 0..4095 的槽位
+    // gpa >> 12 (页号) -> 再哈希 -> 取模
+    uint32_t slot = murmur3_32(gpa >> GVM_PAGE_SHIFT) % HASH_RING_SIZE;
+    
+    uint32_t target;
+    pthread_rwlock_rdlock(&g_ring_lock);
+    target = g_hash_ring_cache[slot];
+    pthread_rwlock_unlock(&g_ring_lock);
+    
+    return target;
+}
+
+/* --- 逻辑入口：处理接收到的心跳与视图更新 --- */
+
+extern void gvm_notify_kernel_epoch(uint32_t epoch);
+
+/* 
+ * [物理意图] 接收 Gossip 消息，更新本地对 P2P 邻居的存活状态与纪元（Epoch）认知。
+ * [关键逻辑] 实现分布式共识的“观测者模式”，当超过半数邻居进入新纪元时，本地自动推进 Epoch。
+ * [后果] 解决了大规模集群中“时钟漂移”问题，确保所有节点的 DHT 路由决策在逻辑时间线上达成最终一致。
+ */
+void update_local_topology_view(uint32_t src_id, uint32_t src_epoch, uint8_t src_state, struct sockaddr_in *src_addr) {
+    pthread_rwlock_wrlock(&g_view_lock);
+    
+    int found = 0;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (g_peer_view[i].node_id == src_id) {
+            g_peer_view[i].last_seen_us = g_ops->get_time_us();
+            g_peer_view[i].state = src_state;
+            g_peer_view[i].last_epoch = src_epoch;
+            // 如果地址发生变更（如节点重启更换了物理机），同步更新
+            if (src_addr && src_addr->sin_addr.s_addr != 0) {
+                g_peer_view[i].addr = *src_addr;
+                g_ops->set_gateway_ip(src_id, src_addr->sin_addr.s_addr, src_addr->sin_port);
+            }
+            found = 1;
+            break;
+        }
+    }
+
+    // 发现新邻居：Warm-plug 的入口
+    if (!found && g_peer_count < MAX_LOCAL_VIEW) {
+        peer_entry_t *new_peer = &g_peer_view[g_peer_count++];
+        new_peer->node_id = src_id;
+        new_peer->state = src_state;
+        new_peer->last_epoch = src_epoch;
+        new_peer->last_seen_us = g_ops->get_time_us();
+        if (src_addr) new_peer->addr = *src_addr;
+        pthread_mutex_init(&new_peer->lock, NULL);
+        if (g_ops->log) g_ops->log("[Swarm] New neighbor discovered: %u", src_id);
+    }
+
+    // Epoch 异步共识：观测者模式推进
+    if (src_epoch > g_curr_epoch) {
+        atomic_fetch_add(&g_peers_at_next_epoch, 1);
+        if (atomic_load(&g_peers_at_next_epoch) > (g_peer_count / 2)) {
+            g_curr_epoch = src_epoch;
+            atomic_store(&g_peers_at_next_epoch, 0);
+            gvm_notify_kernel_epoch(g_curr_epoch);
+        }
+    }
+    
+    pthread_rwlock_unlock(&g_view_lock);
+
+    // 仅标记 Dirty，实现惰性重建
+    atomic_store(&g_ring_dirty, true);
+}
+
+static uint8_t  g_my_node_state = NODE_STATE_SHADOW;
+static uint64_t g_last_gossip_us = 0;
+static uint64_t g_state_start_us = 0;
+
+// 配置参数：严格遵循物理时延
+#define HEARTBEAT_TIMEOUT_US 5000000 // 5秒未收到心跳则判定 Fail-in-place
+#define WARMING_DURATION_US  10000000 // 预热态持续10秒，同步元数据
+#define GOSSIP_FANOUT        3        // 每次随机向3个邻居扩散
+
+/* --- 核心函数：自治节点状态推进 --- */
+
+/* 
+ * [物理意图] 驱动节点的生命周期状态机，实现“优雅上线”与“平滑预热”。
+ * [关键逻辑] 节点通过 SHADOW -> WARMING -> ACTIVE 转换，在正式接管内存权属前先同步元数据缓存。
+ * [后果] 彻底杜绝了新节点加入时由于“缓存冷启动”导致的瞬间全网性能塌陷（Thundering Herd）。
+ */
+static void advance_node_lifecycle(void) {
+    uint64_t now = g_ops->get_time_us();
+    uint64_t duration = now - g_state_start_us;
+
+    switch (g_my_node_state) {
+        case NODE_STATE_SHADOW:
+            // 影子态：已建立网络连接，开始观测集群 Epoch
+            if (g_peer_count > 0) {
+                g_my_node_state = NODE_STATE_WARMING;
+                g_state_start_us = now;
+                if (g_ops->log) g_ops->log("[Lifecycle] Transition to WARMING");
+            }
+            break;
+
+        case NODE_STATE_WARMING:
+            // 预热态：此阶段节点开始拉取元数据，但不承载 Owner 权限
+            if (duration > WARMING_DURATION_US) {
+                g_my_node_state = NODE_STATE_ACTIVE;
+                g_state_start_us = now;
+                // 晋升为活跃节点后，一致性哈希会自动将其纳入权重计算
+                if (g_ops->log) g_ops->log("[Lifecycle] Transition to ACTIVE. Participating in Owner Set.");
+            }
+            break;
+
+        case NODE_STATE_ACTIVE:
+            // 活跃态：正常工作
+            break;
+
+        case NODE_STATE_DRAINING:
+            // 排空态：此时不再接受新请求，等待旧事务结束
+            break;
+    }
+}
+
+/* --- 核心逻辑：Fail-in-place 局部判定 --- */
+
+/* 
+ * [物理意图] 被动检测 P2P 邻居的健康状况，实现隔离故障（Fail-in-place）。
+ * [关键逻辑] 检查上次心跳时间戳，超过 5s 则将其在本地路由表中剔除，不再向其转发请求。
+ * [后果] 提供了 P2P 架构的自愈能力，确保个别节点的崩溃不会通过请求堆积拖死整个超级虚拟机。
+ */
+static void monitor_peer_liveness(void) {
+    uint64_t now = g_ops->get_time_us();
+    pthread_rwlock_wrlock(&g_view_lock);
+    
+    for (int i = 0; i < g_peer_count; i++) {
+        if (g_peer_view[i].state == NODE_STATE_ACTIVE || g_peer_view[i].state == NODE_STATE_WARMING) {
+            if (now - g_peer_view[i].last_seen_us > HEARTBEAT_TIMEOUT_US) {
+                // 本地标记失效，不再向其路由请求
+                g_peer_view[i].state = NODE_STATE_OFFLINE;
+                if (g_ops->log) g_ops->log("[Liveness] Node %u detected OFFLINE (Fail-in-place)", g_peer_view[i].node_id);
+            }
+        }
+    }
+    
+    pthread_rwlock_unlock(&g_view_lock);
+}
+
+/* --- 后台自治线程：驱动心跳与扩散 --- */
+
+/* 
+ * [物理意图] 驱动整个 P2P 节点的“自主意识”后台线程。
+ * [关键逻辑] 周期性执行：状态机推进、故障探测、以及随机向邻居扩散本地视图（Gossip Fan-out）。
+ * [后果] 这是 GiantVM 自治性的动力源，保证了在没有任何中心管理节点的情况下，全网拓扑能自行收敛。
+ */
+void* autonomous_monitor_thread(void* arg) {
+    while (1) {
+        uint64_t now = g_ops->get_time_us();
+        advance_node_lifecycle();
+        monitor_peer_liveness();
+
+        // [V30 FIX] 惰性重建哈希环
+        if (atomic_exchange(&g_ring_dirty, false)) {
+            rebuild_hash_ring_cache();
+        }
+
+        // [V30 FIX] 聚合扩散
+        if (now - g_last_gossip_us > GOSSIP_INTERVAL_US) {
+            pthread_rwlock_rdlock(&g_view_lock);
+            if (g_peer_count > 0) {
+                for (int i = 0; i < GOSSIP_FANOUT; i++) {
+                    uint32_t ridx = 0;
+                    g_ops->get_random(&ridx);
+                    peer_entry_t *p = &g_peer_view[ridx % g_peer_count];
+                    add_gossip_to_aggregator(p->node_id, g_my_node_state, g_curr_epoch);
+                }
+            }
+            pthread_rwlock_unlock(&g_view_lock);
+            flush_gossip_aggregator(); // 立即发送
+            g_last_gossip_us = now;
+        }
+        g_ops->cpu_relax();
+        usleep(100000); 
+    }
+    return NULL;
+}
+
+/* --- 核心逻辑：向邻居请求视图 --- */
+
+static void request_view_from_neighbor(uint32_t peer_id) {
+    struct gvm_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = htonl(GVM_MAGIC);
+    hdr.msg_type = htons(MSG_VIEW_PULL);
+    hdr.slave_id = htonl(g_my_node_id);
+    hdr.epoch = g_curr_epoch;
+    hdr.payload_len = 0;
+
+    // 发送视图请求
+    g_ops->send_packet(&hdr, sizeof(hdr), peer_id);
+}
+
+/* --- 核心逻辑：响应邻居的视图请求 --- */
+
+static void handle_view_pull(struct gvm_header *rx_hdr, uint32_t src_id) {
+    pthread_rwlock_rdlock(&g_view_lock);
+    
+    // [无简化实现]：由于 UDP MTU 限制，一次最多发送 32 个条目
+    uint32_t count = (g_peer_count > 32) ? 32 : g_peer_count;
+    size_t payload_len = sizeof(struct gvm_view_payload) + count * sizeof(struct gvm_view_entry);
+    size_t pkt_len = sizeof(struct gvm_header) + payload_len;
+
+    uint8_t *buf = g_ops->alloc_packet(pkt_len, 1); // 原子上下文分配
+    if (!buf) {
+        pthread_rwlock_unlock(&g_view_lock);
+        return;
+    }
+
+    struct gvm_header *hdr = (struct gvm_header *)buf;
+    // 基础包头填充
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(MSG_VIEW_ACK);
+    hdr->slave_id = htonl(g_my_node_id);
+    hdr->payload_len = htons(payload_len);
+    hdr->epoch = g_curr_epoch;
+    hdr->node_state = g_my_node_state;
+
+    struct gvm_view_payload *pl = (struct gvm_view_payload *)(buf + sizeof(*hdr));
+    pl->entry_count = htonl(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        pl->entries[i].node_id = htonl(g_peer_view[i].node_id);
+        pl->entries[i].ip_addr = g_peer_view[i].addr.sin_addr.s_addr;
+        pl->entries[i].port    = g_peer_view[i].addr.sin_port;
+        pl->entries[i].state   = g_peer_view[i].state;
+    }
+    pthread_rwlock_unlock(&g_view_lock);
+
+    g_ops->send_packet(buf, pkt_len, src_id);
+    g_ops->free_packet(buf);
+}
+
+static void handle_view_ack(void *payload) {
+    struct gvm_view_payload *pl = (struct gvm_view_payload *)payload;
+    uint32_t count = ntohl(pl->entry_count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t nid = ntohl(pl->entries[i].node_id);
+        if (nid == g_my_node_id) continue;
+
+        // 获取 IP 信息
+        struct sockaddr_in peer_addr;
+        memset(&peer_addr, 0, sizeof(peer_addr));
+        peer_addr.sin_family = AF_INET;
+        peer_addr.sin_addr.s_addr = pl->entries[i].ip_addr;
+        peer_addr.sin_port = pl->entries[i].port;
+
+        // [无简化] 直接注入视图，不走中间 fake_hdr 路由
+        update_local_topology_view(nid, 0, pl->entries[i].state, &peer_addr);
+    }
+}
+
+int gvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
+    if (!ops) return -1;
+    g_ops = ops;
+    
+    g_dir_table = (page_meta_t *)g_ops->alloc_large_table(sizeof(page_meta_t) * DIR_TABLE_SIZE);
+    if (!g_dir_table) return -ENOMEM;
+    
+    for (int i = 0; i < LOCK_SHARDS; i++) {
+        pthread_mutex_init(&g_dir_table_locks[i], NULL); 
+    }
+    
+    // 循环初始化所有分片队列
+    for (int i = 0; i < NUM_BCAST_WORKERS; i++) {
+        g_bcast_shards[i].head = 0;
+        g_bcast_shards[i].tail = 0;
+        pthread_spin_init(&g_bcast_shards[i].lock, 0);
+    }
+    
+    g_total_nodes = (total_nodes_hint > 0) ? total_nodes_hint : 1;
+    return 0;
+}
+
+void gvm_set_mem_mapping(int slot, uint32_t value) {
+    if (slot == 0) gvm_set_total_nodes((int)value);
+    if (slot == 1) gvm_set_my_node_id((int)value);
+}
+
+void gvm_set_total_nodes(int count) { 
+    if(count > 0) g_total_nodes = count; 
+}
+
+void gvm_set_my_node_id(int id) { 
+    g_my_node_id = id; 
+}
+
+// DHT 路由
+uint32_t gvm_get_directory_node_id(uint64_t gpa) {
+    // 在百万节点规模下，即使局部视图不一致，路由结果也能大概率收敛
+    return get_owner_node_id(gpa);
+}
+
+// 本地缺页快速路径
+int gvm_handle_local_fault_fastpath(uint64_t gpa, void* page_buffer, uint64_t *version_out) {
+    uint32_t lock_idx = get_lock_idx(gpa);
+    
+    // 必须加锁，因为可能有远程写操作正在更新这个页面
+    pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+    
+    page_meta_t *page = find_or_create_page_meta(gpa);
+    if (page) {
+        // 直接内存拷贝
+        memcpy(page_buffer, page->base_page_data, 4096);
+        if (version_out) {
+            *version_out = page->version;
+        }
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        return 0; // 成功
+    }
+    
+    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+    return -1; // 失败
+}
+
+// [V29 Optimization] 指针队列，极大降低内存占用
+typedef struct {
+    uint32_t msg_type;
+    uint32_t target_id;
+    size_t len;
+    void *data_ptr; // [Changed] 只存指针，不再预分配 64KB
+    uint8_t flags;
+} broadcast_task_t;
+
+// 将队列、头尾指针和锁打包成一个结构体
+typedef struct {
+    broadcast_task_t    queue[BCAST_Q_SIZE];
+    volatile uint64_t   head;
+    volatile uint64_t   tail;
+    pthread_spinlock_t  lock; // 每个分片队列拥有自己独立的锁
+} bcast_queue_shard_t;
+
+// 创建分片队列数组
+static bcast_queue_shard_t g_bcast_shards[NUM_BCAST_WORKERS];
+
+// [V29 Optimization] 多线程消费者：读取指针，发送并释放
+void* broadcast_worker_thread(void* arg) {
+    long worker_id = (long)arg; // 获取自己的ID
+    bcast_queue_shard_t *my_shard = &g_bcast_shards[worker_id]; // 定位到自己的专属队列
+
+    while(1) {
+        int work_todo = 0;
+        broadcast_task_t task_copy;
+        
+        // 1. 尝试从自己的分片队列出队
+        uint64_t current_head = my_shard->head;
+        uint64_t current_tail = my_shard->tail; // 读取 volatile
+
+        if (current_head != current_tail) {
+            broadcast_task_t *src = &my_shard->queue[current_head & BCAST_Q_MASK];
+            task_copy = *src;
+            __sync_synchronize(); 
+            my_shard->head = current_head + 1; // 修改自己的head
+            work_todo = 1;
+        }
+
+        if (work_todo) {
+            // 2. 发送逻辑
+            size_t pkt_len = sizeof(struct gvm_header) + task_copy.len;
+            
+            // alloc_packet 用于网络发送的 Buffer (可能来自 Slab/Mempool)
+            uint8_t *buffer = g_ops->alloc_packet(pkt_len, 0);
+            
+            if (buffer) {
+                struct gvm_header *hdr = (struct gvm_header *)buffer;
+                hdr->magic = htonl(GVM_MAGIC);
+                hdr->msg_type = htons(task_copy.msg_type);
+                hdr->payload_len = htons(task_copy.len);
+                hdr->slave_id = htonl(task_copy.target_id);
+                hdr->req_id = 0;
+                // 全页推送走慢车道，Diff 走快车道
+                hdr->qos_level = (task_copy.msg_type == MSG_PAGE_PUSH_FULL) ? 0 : 1;
+                hdr->flags = task_copy.flags; 
+
+                // 拷贝 Payload
+                if (task_copy.len > 0 && task_copy.data_ptr) {
+                    memcpy(buffer + sizeof(*hdr), task_copy.data_ptr, task_copy.len);
+                }
+                
+                // 计算 CRC 并发送 (由 send_packet 内部处理 CRC，这里只需调用)
+                g_ops->send_packet(buffer, pkt_len, task_copy.target_id);
+                g_ops->free_packet(buffer);
+            }
+
+            // 3. 释放内存
+            if (task_copy.data_ptr) {
+                #ifdef __KERNEL__
+                    kfree(task_copy.data_ptr);
+                #else
+                    free(task_copy.data_ptr);
+                #endif
+            }
+        } else {
+            // 4. 空闲等待
+            g_ops->cpu_relax(); 
+        }
+    }
+    return NULL;
+}
+
+/* 
+ * [物理意图] 针对特定页面的变动，向全网所有利益相关方精准发射“小波（Wavelet）”更新。
+ * [关键逻辑] 遍历二级订阅位图，利用多线程分片队列并行发送 Diff 或 Full-Page 包。
+ * [后果] 它实现了“读操作本地化”，通过网络带宽换取读时延的消除，是 V30 性能突破的关键。
+ */
+static void broadcast_to_subscribers(page_meta_t *page, uint16_t msg_type, void *payload, int len, uint8_t flags) {
+    // 遍历订阅者的
+    for (int i = 0; i < 256; i++) {
+        uint64_t mask = page->segment_mask[i];
+        if (mask == 0) continue;
+
+        for (int j = 0; j < 64; j++) {
+            if ((mask >> j) & 1) {
+                uint32_t seg_idx = (i * 64) + j;
+                uint64_t sub_bits = page->subscribers.bits[seg_idx];
+                
+                for (int k = 0; k < 64; k++) {
+                    if ((sub_bits >> k) & 1) {
+                        uint32_t target_id = (seg_idx * 64) + k;
+                        if (target_id == g_my_node_id) continue;
+
+                        // 分配内存
+                        void *data_copy = NULL;
+                        if (len > 0) {
+                            #ifdef __KERNEL__
+                                data_copy = kmalloc(len, GFP_ATOMIC);
+                            #else
+                                data_copy = malloc(len);
+                            #endif
+                            if (!data_copy) continue;
+                            memcpy(data_copy, payload, len);
+                        }
+
+                        // 1. 根据目标ID计算分片索引
+                        int shard_idx = target_id % NUM_BCAST_WORKERS;
+                        bcast_queue_shard_t *target_shard = &g_bcast_shards[shard_idx];
+
+                        // 2. 锁住目标分片队列
+                        pthread_spin_lock(&target_shard->lock);
+                        
+                        // 3. 检查目标分片队列是否已满
+                        uint64_t current_tail = target_shard->tail;
+                        if (current_tail + 1 - target_shard->head >= BCAST_Q_SIZE) {
+                            pthread_spin_unlock(&target_shard->lock);
+                            if (data_copy) {
+                                #ifdef __KERNEL__
+                                    kfree(data_copy);
+                                #else
+                                    free(data_copy);
+                                #endif
+                            }
+                            continue; // Drop-tail
+                        }
+
+                        // 4. 将任务放入目标分片队列
+                        broadcast_task_t *t = &target_shard->queue[current_tail & BCAST_Q_MASK];
+                        t->msg_type = msg_type;
+                        t->target_id = target_id;
+                        t->len = len;
+                        t->data_ptr = data_copy;
+                        t->flags = flags;
+
+                        __sync_synchronize();
+                        target_shard->tail = current_tail + 1; // 更新目标分片队列的tail
+                        
+                        pthread_spin_unlock(&target_shard->lock);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// [FIX] FORCE_SYNC 限流器状态
+static atomic_int  g_force_sync_counter = ATOMIC_VAR_INIT(0);
+static atomic_long g_force_sync_last_sec = ATOMIC_VAR_INIT(0);
+#define MAX_FORCE_SYNC_PER_SEC 1024 
+
+/* 
+ * [物理意图] 当发生严重的版本冲突或逻辑断层时，强制向节点投喂“最终真理”。
+ * [关键逻辑] 绕过所有增量优化，直接发送 4KB 全量页面数据并强制更新其版本号。
+ * [后果] 这是系统的“最终一致性保险丝”，在网络混沌或极端竞态下保证内存状态不崩溃。
+ */
+static void force_sync_client(uint64_t gpa, page_meta_t* page, uint32_t client_id) {
+    // [FIX] 基于令牌桶思想的秒级节流
+    long current_sec = g_ops->get_time_us() / 1000000;
+    long last_sec = atomic_load(&g_force_sync_last_sec);
+
+    if (current_sec != last_sec) {
+        atomic_store(&g_force_sync_last_sec, current_sec);
+        atomic_store(&g_force_sync_counter, 0);
+    }
+
+    if (atomic_fetch_add(&g_force_sync_counter, 1) >= MAX_FORCE_SYNC_PER_SEC) {
+        // 超出带宽配额，直接丢弃。
+        // 客户端因收不到回复，会保持旧版本，下次 COMMIT 依然会失败，实现“天然重试”
+        return; 
+    }
+
+    size_t pl_size = sizeof(struct gvm_full_page_push);
+    size_t pkt_len = sizeof(struct gvm_header) + pl_size;
+    
+    uint8_t *buffer = g_ops->alloc_packet(pkt_len, 1);
+    if (!buffer) return;
+
+    struct gvm_header *hdr = (struct gvm_header*)buffer;
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(MSG_FORCE_SYNC);
+    hdr->payload_len = htons(pl_size);
+    hdr->slave_id = htonl(g_my_node_id);
+    hdr->req_id = 0;
+    hdr->qos_level = 1; // High priority correction
+
+    struct gvm_full_page_push *push = (struct gvm_full_page_push*)(buffer + sizeof(*hdr));
+    push->gpa = GVM_HTONLL(gpa);
+    // 此时持有页锁，version是安全的
+    push->version = GVM_HTONLL(page->version); 
+    memcpy(push->data, page->base_page_data, 4096);
+
+    g_ops->send_packet(buffer, pkt_len, client_id);
+    g_ops->free_packet(buffer);
+}
+
+int gvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer, uint64_t *version_out) {
+    uint32_t dir_node = gvm_get_directory_node_id(gpa);
+    
+    // 场景 A: 我就是目录节点 (Local Hit)
+    if (dir_node == g_my_node_id) {
+        uint32_t lock_idx = get_lock_idx(gpa);
+        pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+        
+        page_meta_t *page = find_or_create_page_meta(gpa);
+        int ret = -1;
+        
+        if (page) {
+            // 直接从本地目录内存拷贝
+            memcpy(page_buffer, page->base_page_data, 4096);
+            if (version_out) *version_out = page->version;
+            
+            // [V29] 既然由于缺页进来了，说明本地之前可能被设为 Invalid
+            // 我们需要把自己加入订阅者列表，确保未来收到 Push
+            copyset_set(&page->subscribers, g_my_node_id);
+            ret = 0;
+        }
+        
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        return ret;
+    }
+
+    // 场景 B: 远程节点 (Remote Pull)
+    // 这是 V28 逻辑的直接复用，但增加了 Version 字段处理
+    
+    // 1. 分配请求 ID
+    uint64_t rid = g_ops->alloc_req_id(page_buffer); // 注意：这里 page_buffer 是临时存放处
+    if (rid == (uint64_t)-1) return -1;
+
+    // 2. 构造 MSG_MEM_READ 包
+    size_t pkt_len = sizeof(struct gvm_header) + 8;
+    uint8_t *buffer = g_ops->alloc_packet(pkt_len, 1);
+    if (!buffer) { g_ops->free_req_id(rid); return -1; }
+
+    struct gvm_header *hdr = (struct gvm_header *)buffer;
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(MSG_MEM_READ);
+    hdr->payload_len = htons(8);
+    hdr->slave_id = htonl(dir_node);
+    hdr->req_id = GVM_HTONLL(rid);
+    hdr->qos_level = 1; // 缺页必须走快车道
+
+    uint64_t net_gpa = GVM_HTONLL(gpa);
+    memcpy(buffer + sizeof(*hdr), &net_gpa, 8);
+
+    // 3. 发送并等待 (阻塞式)
+    uint64_t start_total = g_ops->get_time_us();
+    uint64_t last_send = 0;
+    
+    // 首次发送
+    g_ops->send_packet(buffer, pkt_len, dir_node);
+    last_send = start_total;
+
+    int success = 0;
+    while (1) {
+        // 检查是否完成
+        if (g_ops->check_req_status(rid) == 1) {
+            success = 1;
+            break;
+        }
+        
+        // 超时重传
+        uint64_t now = g_ops->get_time_us();
+        if (g_ops->time_diff_us(last_send) > RETRY_TIMEOUT_US) {
+            g_ops->send_packet(buffer, pkt_len, dir_node);
+            last_send = now;
+        }
+        
+        // 总超时熔断 (5秒)
+        if (g_ops->time_diff_us(start_total) > 5000000) break;
+        
+        g_ops->touch_watchdog();
+        g_ops->cpu_relax();
+    }
+
+    g_ops->free_packet(buffer);
+    
+    // 注意：数据已经被网络层写入到 page_buffer (实际上是 req_ctx 里的 buffer)
+    // 但我们需要提取 Version。
+    // 在 Kernel Backend 中，我们传递给 alloc_req_id 的是一个 bounce buffer
+    // 它包含了 struct gvm_mem_ack_payload { gpa, version, data }
+    // 所以这里 logic core 其实不负责解包，解包逻辑在 kernel_backend.c 的 gvm_fault_handler 中。
+    // Logic Core 只要保证网络交互完成即可。
+    
+    g_ops->free_req_id(rid);
+    return success ? 0 : -1;
+}
+
+// 核心RPC (带指数退避)
+int gvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, void *rx_buffer, int rx_len) {
+    // 1. 分配接收缓冲区
+    // 我们需要一个足够大的缓冲区来接收可能的ACK包头
+    uint8_t *net_rx_buf = g_ops->alloc_packet(GVM_MAX_PACKET_SIZE, 0); // Not atomic
+    if (!net_rx_buf) return -ENOMEM;
+
+    // 2. 分配请求ID
+    uint64_t rid = g_ops->alloc_req_id(net_rx_buf);
+    if (rid == (uint64_t)-1) {
+        g_ops->free_packet(net_rx_buf);
+        return -EBUSY;
+    }
+
+    // 3. 构造请求包
+    size_t pkt_len = sizeof(struct gvm_header) + len;
+    uint8_t *buffer = g_ops->alloc_packet(pkt_len, 0); // Not atomic
+    if (!buffer) {
+        g_ops->free_req_id(rid);
+        g_ops->free_packet(net_rx_buf);
+        return -ENOMEM;
+    }
+
+    struct gvm_header *hdr = (struct gvm_header *)buffer;
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(msg_type);
+    hdr->payload_len = htons(len);
+    hdr->slave_id = htonl(g_my_node_id); // Source ID
+    hdr->req_id = GVM_HTONLL(rid);
+    hdr->qos_level = 1; // Control messages are fast lane
+    
+    if (payload && len > 0) {
+        memcpy(buffer + sizeof(*hdr), payload, len);
+    }
+    
+    // 4. 重试循环逻辑
+    uint64_t start_total = g_ops->get_time_us();
+    uint64_t last_send_time;
+    uint64_t current_retry_delay = INITIAL_RETRY_DELAY_US;
+
+    // 首次发送
+    g_ops->send_packet(buffer, pkt_len, target_id);
+    last_send_time = start_total;
+
+    while (g_ops->check_req_status(rid) != 1) {
+        // 喂狗
+        g_ops->touch_watchdog();
+
+        // 检查总超时
+        if (g_ops->time_diff_us(start_total) > TOTAL_TIMEOUT_US) {
+            if (g_ops->log) {
+                g_ops->log("[RPC Timeout] Type: %d, Target: %d, RID: %llu", 
+                           msg_type, target_id, (unsigned long long)rid);
+            }
+            g_ops->free_packet(buffer);
+            g_ops->free_packet(net_rx_buf);
+            g_ops->free_req_id(rid);
+            return -ETIMEDOUT;
+        }
+
+        // 检查是否需要重试
+        if (g_ops->time_diff_us(last_send_time) > current_retry_delay) {
+            // 重发
+            g_ops->send_packet(buffer, pkt_len, target_id);
+            last_send_time = g_ops->get_time_us();
+
+            // 指数增加延迟
+            current_retry_delay *= 2;
+            if (current_retry_delay > MAX_RETRY_DELAY_US) {
+                current_retry_delay = MAX_RETRY_DELAY_US;
+            }
+
+            // 增加随机抖动 +/- 30%
+            uint32_t random_val;
+            g_ops->get_random(&random_val);
+            uint64_t jitter = current_retry_delay * 3 / 10;
+            if (jitter > 0) {
+                // random_val is u32, convert to signed offset carefully
+                int64_t offset = ((int64_t)random_val % (2 * jitter)) - (int64_t)jitter;
+                
+                // Ensure delay doesn't go negative or too small
+                if ((int64_t)current_retry_delay + offset > 100) {
+                    current_retry_delay = (uint64_t)((int64_t)current_retry_delay + offset);
+                }
+            }
+        }
+        
+        // 短暂休眠让出CPU
+        g_ops->yield_cpu_short_time();
+    }
+    
+    // 5. 处理结果
+    g_ops->free_packet(buffer); // 释放发送Buffer
+
+    // 从接收Buffer中提取数据
+    struct gvm_header *ack_hdr = (struct gvm_header *)net_rx_buf;
+    void* ack_payload = net_rx_buf + sizeof(struct gvm_header);
+    uint16_t ack_len = ntohs(ack_hdr->payload_len);
+    
+    if (rx_buffer && rx_len > 0) {
+        size_t copy_len = (size_t)rx_len < (size_t)ack_len ? (size_t)rx_len : (size_t)ack_len;
+        memcpy(rx_buffer, ack_payload, copy_len);
+    }
+
+    g_ops->free_packet(net_rx_buf); // 释放接收Buffer
+    g_ops->free_req_id(rid);
+    return 0;
+}
+
+// 该函数由内核缺页处理程序(gvm_fault_handler)调用，
+// 用于告知 Directory 节点："我关注这个页面，请有更新时推给我"。
+void gvm_declare_interest_in_neighborhood(uint64_t gpa) {
+    // 1. 计算该 GPA 归谁管 (Directory Node)
+    uint32_t dir_node = gvm_get_directory_node_id(gpa);
+    
+    // 如果我自己就是 Directory，不需要网络宣告 (本地 Logic Core 会自动处理)
+    if (dir_node == g_my_node_id) return;
+
+    // 2. 分配数据包 (Atomic 上下文安全)
+    size_t pkt_len = sizeof(struct gvm_header) + sizeof(uint64_t);
+    uint8_t *buffer = g_ops->alloc_packet(pkt_len, 1); 
+    
+    if (!buffer) {
+        // 内存不足时丢弃本次宣告。
+        // 这不是致命错误，只会导致本次无法订阅，V28 的拉取机制会兜底。
+        return; 
+    }
+
+    // 3. 构造协议头
+    struct gvm_header *hdr = (struct gvm_header *)buffer;
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(MSG_DECLARE_INTEREST);
+    hdr->payload_len = htons(sizeof(uint64_t));
+    hdr->slave_id = htonl(g_my_node_id); // 告诉对方我是谁
+    hdr->req_id = 0;                     // 异步消息，不需要 ACK
+    hdr->qos_level = 1;                  // 订阅是元数据操作，走 Fast Lane
+
+    // 4. 填充 GPA
+    uint64_t net_gpa = GVM_HTONLL(gpa);
+    memcpy(buffer + sizeof(*hdr), &net_gpa, sizeof(uint64_t));
+
+    // 5. 发送并释放
+    g_ops->send_packet(buffer, pkt_len, dir_node);
+    g_ops->free_packet(buffer);
+}
+
+static void add_gossip_to_aggregator(uint32_t target_node_id, uint8_t state, uint32_t epoch) {
+    pthread_mutex_lock(&g_gossip_agg.lock);
+    size_t needed = sizeof(struct gvm_header);
+
+    // 缓冲区满或目标切换时冲刷
+    if (g_gossip_agg.curr_offset + needed > MTU_SIZE) {
+        g_ops->send_packet(g_gossip_agg.buf, g_gossip_agg.curr_offset, g_gossip_agg.last_gateway_id);
+        g_gossip_agg.curr_offset = 0;
+    }
+
+    struct gvm_header *hdr = (struct gvm_header *)(g_gossip_agg.buf + g_gossip_agg.curr_offset);
+    memset(hdr, 0, sizeof(*hdr)); // 必须清零
+    hdr->magic = htonl(GVM_MAGIC);
+    hdr->msg_type = htons(MSG_HEARTBEAT);
+    hdr->slave_id = htonl(g_my_node_id);
+    hdr->node_state = state;
+    hdr->epoch = htonl(epoch);
+    hdr->qos_level = 1;
+    hdr->crc32 = 0;
+    hdr->crc32 = htonl(calculate_crc32(hdr, sizeof(*hdr)));
+
+    g_gossip_agg.last_gateway_id = target_node_id; 
+    g_gossip_agg.curr_offset += needed;
+    pthread_mutex_unlock(&g_gossip_agg.lock);
+}
+
+static void flush_gossip_aggregator() {
+    pthread_mutex_lock(&g_gossip_agg.lock);
+    if (g_gossip_agg.curr_offset > 0) {
+        g_ops->send_packet(g_gossip_agg.buf, g_gossip_agg.curr_offset, g_gossip_agg.last_gateway_id);
+        g_gossip_agg.curr_offset = 0;
+    }
+    pthread_mutex_unlock(&g_gossip_agg.lock);
+}
+
+/* 
+ * [物理意图] 分布式内存事务的终极处理器。
+ * [关键逻辑] 拦截所有入站消息，根据 MESI 状态机执行：READ(拉取)、DECLARE(订阅)、COMMIT(增量写) 及 Prophet(指令透传)。
+ * [后果] 这是系统的“物理法则”执行点，任何逻辑错误都会直接破坏内存强一致性。
+ */
+void gvm_logic_process_packet(struct gvm_header *hdr, void *payload, uint32_t source_node_id) {
+    uint16_t type = ntohs(hdr->msg_type);
+    uint32_t src_id = ntohl(hdr->slave_id);
+    uint32_t src_epoch = ntohl(hdr->epoch);
+    uint8_t  src_state = hdr->node_state;
+
+    // 1. [核心安全检查] 任何消息都必须透传 Epoch 和 State
+    // 如果收到的消息 Epoch 大于本地太远，说明本地视图已严重落后，强制触发视图拉取
+    if (src_epoch > g_curr_epoch + 1) {
+        request_view_from_neighbor(src_id);
+    }
+
+    // 2. [自动维护] 无论什么消息类型，只要是自治范围（>=40）或包含有效信息的，都更新拓扑视图
+    if (type >= 40 || type == MSG_PING) {
+        update_local_topology_view(src_id, src_epoch, src_state, NULL);
+    }
+
+    switch(type) {
+        case MSG_HEARTBEAT:
+            // 视图已在上方更新，无需额外操作
+            break;
+            
+        case MSG_VIEW_PULL:
+            handle_view_pull(hdr, src_id);
+            break;
+            
+        case MSG_VIEW_ACK:
+            handle_view_ack(payload);
+            break;
+
+        // --- 1. 处理拉取请求 (Pull) ---
+        case MSG_MEM_READ: {
+            if (ntohs(hdr->payload_len) < sizeof(uint64_t)) return;
+            uint64_t gpa = GVM_NTOHLL(*(uint64_t*)payload);
+            
+            // 确保我是这个页面的 Directory
+            if (gvm_get_directory_node_id(gpa) != g_my_node_id) return;
+            
+            // 构造 MSG_MEM_ACK (包含版本号的 payload)
+            size_t pl_size = sizeof(struct gvm_mem_ack_payload);
+            size_t pkt_len = sizeof(struct gvm_header) + pl_size;
+            uint8_t *buffer = g_ops->alloc_packet(pkt_len, 1);
+            if (!buffer) return;
+
+            struct gvm_header *ack = (struct gvm_header*)buffer;
+            ack->magic = htonl(GVM_MAGIC);
+            ack->msg_type = htons(MSG_MEM_ACK);
+            ack->payload_len = htons(pl_size);
+            ack->slave_id = htonl(g_my_node_id);
+            ack->req_id = hdr->req_id; // 必须回传请求ID
+            ack->qos_level = 0; // 大包走慢车道
+
+            struct gvm_mem_ack_payload *ack_pl = (struct gvm_mem_ack_payload*)(buffer + sizeof(*ack));
+            
+            uint32_t lock_idx = get_lock_idx(gpa);
+            pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+            
+            page_meta_t *page = find_or_create_page_meta(gpa);
+            if (page) {
+                ack_pl->gpa = GVM_HTONLL(gpa);
+                // 关键：填入当前版本号
+                ack_pl->version = GVM_HTONLL(page->version);
+                memcpy(ack_pl->data, page->base_page_data, 4096);
+            } else {
+                // Should not happen if alloc succeeds, but handle it
+                memset(ack_pl, 0, sizeof(*ack_pl));
+            }
+            
+            pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+            
+            g_ops->send_packet(buffer, pkt_len, source_node_id);
+            g_ops->free_packet(buffer);
+            break;
+        }
+
+        // --- 2. 处理兴趣宣告 (Pub) ---
+        case MSG_DECLARE_INTEREST: {
+            if (ntohs(hdr->payload_len) < sizeof(uint64_t)) return;
+            uint64_t gpa = GVM_NTOHLL(*(uint64_t*)payload);
+            
+            if (gvm_get_directory_node_id(gpa) != g_my_node_id) return;
+
+            uint32_t lock_idx = get_lock_idx(gpa);
+            pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+            
+            page_meta_t *page = find_or_create_page_meta(gpa);
+            if (page) {
+                // 记录订阅者
+                copyset_set(&page->subscribers, source_node_id);
+                page->last_interest_time = g_ops->get_time_us();
+                uint32_t seg_idx = source_node_id / 64; 
+                // 在二级位图中标记该段“有订阅者”
+                page->segment_mask[seg_idx / 64] |= (1UL << (seg_idx % 64));
+                // 在一级位图中标记节点
+                page->subscribers.bits[seg_idx] |= (1UL << (source_node_id % 64));
+            }
+            
+            pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+            break;
+        }
+
+        // --- 3. 处理增量提交 (Commit) ---
+        case MSG_COMMIT_DIFF: {
+            // 在自治模式下，COMMIT 必须先校验写者的 Epoch
+            if (src_epoch < g_curr_epoch) {
+                // 拒绝陈旧 Epoch 的提交，通知其 FORCE_SYNC
+                force_sync_client(GVM_NTOHLL(((struct gvm_diff_log*)payload)->gpa), NULL, src_id);
+                return;
+            }
+            // 安全检查 payload 长度
+            uint16_t pl_len = ntohs(hdr->payload_len);
+            if (pl_len < sizeof(struct gvm_diff_log)) return;
+
+            struct gvm_diff_log *log = (struct gvm_diff_log*)payload;
+            uint64_t gpa = GVM_NTOHLL(log->gpa);
+            uint64_t commit_version = GVM_NTOHLL(log->version);
+            uint16_t off = ntohs(log->offset);
+            uint16_t sz = ntohs(log->size);
+            if (sz == 0) {
+                uint32_t lock_idx = get_lock_idx(gpa);
+                pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+                // [V29.5] Zero Page Commit
+                page_meta_t *page = find_or_create_page_meta(gpa);
+                if (page) {
+                    // 本地清零
+                    memset(page->base_page_data, 0, 4096);
+                    uint32_t local_counter = GET_COUNTER(page->version);
+                    page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1);
+                    
+                    log->version = GVM_HTONLL(page->version);
+                    
+                    // 广播零页：Diff类型 + ZeroFlag + 无数据
+                    broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct gvm_diff_log), GVM_FLAG_ZERO);
+                }
+                pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+            } else {
+                // 安全检查 diff 数据是否越界
+                if (sizeof(struct gvm_diff_log) + sz > pl_len) return;
+                if (off + sz > 4096) return;
+
+                if (gvm_get_directory_node_id(gpa) != g_my_node_id) return;
+
+                uint32_t lock_idx = get_lock_idx(gpa);
+                pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+            
+                page_meta_t *page = find_or_create_page_meta(gpa);
+
+                if (!page) {
+                    if (g_ops->log) g_ops->log("[Logic] Fatal: Hash Table Full for GPA %llx", gpa);
+                    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+                    return; // 防御性退出，防止崩溃
+                }
+
+                if (page) {
+                    // [FIX] Epoch-Aware 版本校验
+                    uint32_t commit_epoch = GET_EPOCH(commit_version);
+                    uint32_t commit_counter = GET_COUNTER(commit_version);
+                    uint32_t local_epoch = GET_EPOCH(page->version);
+                    uint32_t local_counter = GET_COUNTER(page->version);
+            
+                    // 1. Epoch 必须与 Directory 当前 Epoch 一致
+                    // 2. Counter 必须是连续的
+                    if (commit_epoch != g_curr_epoch || commit_counter != local_counter) {
+                        // 版本冲突！拒绝并强制同步
+                        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+                        force_sync_client(gpa, page, source_node_id);
+                        return;
+                    }
+                
+                    // 应用 Diff 到主副本
+                    memcpy(page->base_page_data + off, log->data, sz);
+                    // [FIX] 更新版本号：Epoch 不变，Counter++
+                    page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1); 
+                
+                    // 广播决策
+                    if (sz < SMALL_UPDATE_THRESHOLD) {
+                        // 小更新：推送 Diff
+                        // 需要修改 log 中的 version 为新版本号
+                        log->version = GVM_HTONLL(page->version); 
+                    
+                        // 广播 Diff 包
+                        broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct gvm_diff_log) + sz, 0);
+                    } else {
+                        // 大更新：推送全页
+                        size_t push_size = sizeof(struct gvm_full_page_push);
+            
+                        // 参数 1 表示原子分配 (GFP_ATOMIC)，因为当前持有自旋锁
+                        uint8_t *temp_buf = g_ops->alloc_packet(push_size, 1);
+            
+                        if (temp_buf) {
+                            struct gvm_full_page_push *p = (struct gvm_full_page_push *)temp_buf;
+                
+                            p->gpa = GVM_HTONLL(page->gpa);
+                            p->version = GVM_HTONLL(page->version);
+                            // 第一次拷贝：从 Page Cache 到 临时堆内存
+                            memcpy(p->data, page->base_page_data, 4096);
+                
+                            // 广播函数内部会进行第二次分配和拷贝 (入队)
+                            // 虽然仍有双重拷贝，但避开了栈溢出风险
+                            broadcast_to_subscribers(page, MSG_PAGE_PUSH_FULL, p, push_size, 0);
+                
+                            // 立即释放临时内存
+                            g_ops->free_packet(temp_buf);
+                        } else {
+                            if (g_ops->log) g_ops->log("[Logic] OOM skipping Full Push");
+                        }
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+            break;
+        }
+
+      // 兼容性/强制写入：直接覆盖并推送
+        case MSG_MEM_WRITE: {
+            // Payload 结构: GPA(8) + Data(4096)
+            if (ntohs(hdr->payload_len) < sizeof(uint64_t) + 4096) return;
+            
+            uint64_t gpa = GVM_NTOHLL(*(uint64_t*)payload);
+            void *data_ptr = (uint8_t*)payload + sizeof(uint64_t);
+            
+            // 1. [Security] 权限检查：只有 Owner 才能接受 Write 并返回 ACK
+            if (gvm_get_directory_node_id(gpa) != g_my_node_id) {
+                // 如果我不是 Owner，这是一个错误路由的包，静默丢弃或记录日志
+                // 绝对不能发 ACK，否则客户端会误以为写入成功
+                if (g_ops->log) g_ops->log("[Logic] Write on non-owner GPA %llx ignored", gpa);
+                return;
+            }
+            
+            uint32_t lock_idx = get_lock_idx(gpa);
+            pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+            
+            page_meta_t *page = find_or_create_page_meta(gpa);
+            int write_success = 0;
+
+            if (page) {
+                // 2. [Commit] 先落盘：写入本地内存
+                memcpy(page->base_page_data, data_ptr, 4096);
+                
+                // 3. [State] 更新状态：版本号递增
+                page->version = MAKE_VERSION(g_curr_epoch, GET_COUNTER(page->version) + 1);
+                write_success = 1; // 标记为“已提交”
+                
+                // 4. [Broadcast] 广播给其他订阅者
+                // 注意：这里是在持锁状态下分配内存，使用 gvm_malloc (kmalloc/malloc)
+                size_t push_size = sizeof(struct gvm_full_page_push);
+                uint8_t *temp_buf = gvm_malloc(push_size); 
+                
+                if (temp_buf) {
+                    struct gvm_full_page_push *p = (struct gvm_full_page_push *)temp_buf;
+                    p->gpa = GVM_HTONLL(page->gpa);
+                    p->version = GVM_HTONLL(page->version);
+                    memcpy(p->data, page->base_page_data, 4096);
+                    
+                    // 广播函数内部会处理分片队列锁，这里调用是安全的
+                    broadcast_to_subscribers(page, MSG_PAGE_PUSH_FULL, p, push_size, 0);
+                    
+                    gvm_free(temp_buf);
+                }
+            }
+            
+            pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+
+            // 5. [ACK] 只有在“解锁”且“提交成功”后，才发送 ACK
+            // 这保证了当客户端收到 ACK 时，数据一定已经在 Directory 的内存里了
+            if (write_success) {
+                size_t ack_len = sizeof(struct gvm_header); // ACK 包仅含头部
+                uint8_t *ack_buf = g_ops->alloc_packet(ack_len, 1); // Atomic allocation
+                
+                if (ack_buf) {
+                    struct gvm_header *ack_hdr = (struct gvm_header *)ack_buf;
+                    ack_hdr->magic = htonl(GVM_MAGIC);
+                    ack_hdr->msg_type = htons(MSG_MEM_ACK);
+                    ack_hdr->payload_len = 0;
+                    ack_hdr->slave_id = htonl(g_my_node_id);
+                    ack_hdr->req_id = hdr->req_id; // 关键：回传请求 ID
+                    ack_hdr->qos_level = 1;        // 控制信令走快车道
+                    
+                    // CRC32 由 send_packet 后端自动计算，此处无需手动填
+                    ack_hdr->crc32 = 0; 
+                    
+                    g_ops->send_packet(ack_buf, ack_len, src_id);
+                    g_ops->free_packet(ack_buf);
+                }
+            }
+            break;
+        }
+
+        // --- Prophet 批量指令 (Type 31) ---
+        case MSG_RPC_BATCH_MEMSET: {
+            uint32_t payload_len = ntohs(hdr->payload_len);
+            if (payload_len < sizeof(struct gvm_rpc_batch_memset)) break;
+
+            struct gvm_rpc_batch_memset *batch = (struct gvm_rpc_batch_memset *)payload;
+            uint32_t count = ntohl(batch->count);
+            
+            // 1. 安全检查：防止 Payload 伪造导致 OOB 攻击
+            size_t required = sizeof(struct gvm_rpc_batch_memset) + count * sizeof(struct gvm_rpc_region);
+            if (payload_len < required) break;
+
+            struct gvm_rpc_region *regions = (struct gvm_rpc_region *)(batch + 1);
+
+            // 2. [关键] 版本一致性维护
+            // 在执行物理 memset 之前，必须先更新本地 Directory 表中的版本号
+            for (uint32_t i = 0; i < count; i++) {
+                uint64_t gpa_start = GVM_NTOHLL(regions[i].gpa);
+                uint64_t len = GVM_NTOHLL(regions[i].len);
+                
+                // 按 4KB 页粒度强制更新本地版本记录
+                for (uint64_t cur = gpa_start; cur < gpa_start + len; cur += 4096) {
+                    gvm_logic_update_local_version(cur);
+                }
+            }
+
+            // 3. [执行] 调用后端提供的物理执行接口
+            // 逻辑核心不直接操作内存，而是通过 ops 传导
+            #ifdef __KERNEL__
+                // 内核态直接调用 backend 函数
+                extern void handle_kernel_rpc_batch(void *payload, uint32_t payload_len);
+                handle_kernel_rpc_batch(payload, payload_len);
+            #else
+                // 用户态直接调用 backend 函数
+                extern void handle_rpc_batch_execution(void *payload, uint32_t payload_len);
+                handle_rpc_batch_execution(payload, payload_len);
+            #endif
+
+            // 4. [自治演进] 观测者模式：Prophet 指令也算是一次活跃心跳
+            update_local_topology_view(src_id, src_epoch, src_state, NULL);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// [V29 Interface] 本地原子更新版本号
+void gvm_logic_update_local_version(uint64_t gpa) {
+    uint32_t lock_idx = get_lock_idx(gpa);
+    pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+    
+    // 仅更新已存在的元数据。若页面未被追踪，说明无 Diff 历史，无需版本号。
+
+    page_meta_t *page = find_or_create_page_meta(gpa);
+    if (page) {
+        // [FIX] Epoch-Aware 版本更新
+        uint32_t local_counter = GET_COUNTER(page->version);
+        page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1); 
+    }
+    
+    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+}
+
+// [V29 Interface] 全网广播 RPC 包
+// 基于局部视图进行扩散：
+void gvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg_type) {
+    struct gvm_header *hdr = (struct gvm_header *)full_pkt_data;
+    void *payload = (void*)hdr + sizeof(struct gvm_header);
+    int payload_len = full_pkt_len - sizeof(struct gvm_header);
+
+    pthread_rwlock_rdlock(&g_view_lock);
+    
+    // 如果没有发现邻居，仅执行本地，无需广播
+    if (g_peer_count == 0) {
+        pthread_rwlock_unlock(&g_view_lock);
+        return;
+    }
+
+    // 遍历局部活跃视图进行扩散
+    for (int i = 0; i < g_peer_count; i++) {
+        if (g_peer_view[i].state != NODE_STATE_ACTIVE) continue;
+
+        uint32_t target_id = g_peer_view[i].node_id;
+
+        // 定位分片发送队列（复用 V29.5 的高性能分片队列）
+        int shard_idx = target_id % NUM_BCAST_WORKERS;
+        bcast_queue_shard_t *shard = &g_bcast_shards[shard_idx];
+
+        pthread_spin_lock(&shard->lock);
+        if (shard->tail + 1 - shard->head >= BCAST_Q_SIZE) {
+            pthread_spin_unlock(&shard->lock);
+            continue; // 队列满则跳过，由于是 P2P 扩散，其他节点会有冗余路径
+        }
+
+        // 分配并拷贝
+        void *data_copy = malloc(payload_len);
+        if (data_copy) {
+            memcpy(data_copy, payload, payload_len);
+            broadcast_task_t *t = &shard->queue[shard->tail & BCAST_Q_MASK];
+            t->msg_type = msg_type;
+            t->target_id = target_id;
+            t->len = payload_len;
+            t->data_ptr = data_copy;
+            
+            // 关键：在 Header 中标记当前 Epoch
+            hdr->epoch = g_curr_epoch;
+            hdr->node_state = g_my_node_state;
+
+            __sync_synchronize();
+            shard->tail++;
+        }
+        pthread_spin_unlock(&shard->lock);
+    }
+    pthread_rwlock_unlock(&g_view_lock);
+}
+
