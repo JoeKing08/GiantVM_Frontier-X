@@ -22,7 +22,16 @@
  * 注意：如果将其调大，需要同步调整网关的路由表内存分配大小。
  */
 #ifndef WVM_SLAVE_BITS
+/*
+ * Default node-id bit width.
+ * Userspace may target million-node scale; the in-kernel smoke-test path must
+ * keep static allocations bounded (copyset_t/page_meta_t lives in-memory).
+ */
+#ifdef __KERNEL__
+#define WVM_SLAVE_BITS 12
+#else
 #define WVM_SLAVE_BITS 20
+#endif
 #endif
 
 // --- 网络字节序转换宏 ---

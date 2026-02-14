@@ -120,7 +120,7 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 
 // --- 目录表定义 ---
 #ifdef __KERNEL__
-#define DIR_TABLE_SIZE (1024 * 64) // Keep kernel smoke-test footprint bounded
+#define DIR_TABLE_SIZE (1024 * 4) // Keep kernel smoke-test footprint bounded
 #else
 #define DIR_TABLE_SIZE (1024 * 64) // User-mode smoke test friendly size
 #endif
