@@ -1146,11 +1146,17 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
  * 注意：如果将其调大，需要同步调整网关的路由表内存分配大小。
  */
 #ifndef WVM_SLAVE_BITS
+/*
+ * Default node-id bit width.
+ * Userspace may target million-node scale; the in-kernel smoke-test path must
+ * keep static allocations bounded (copyset_t/page_meta_t lives in-memory).
+ */
+#ifdef __KERNEL__
+#define WVM_SLAVE_BITS 12
+#else
 #define WVM_SLAVE_BITS 20
 #endif
-
-#include <endian.h>
-#include <arpa/inet.h>
+#endif
 
 // --- 网络字节序转换宏 ---
 /*
@@ -1160,9 +1166,9 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
  * 2. 这里的实现兼容了 x86 (Little-Endian) 和其他架构。
  * 3. 若不转换，跨架构通信时 GPA 地址会解析错误，导致读写错误的物理内存。
  */
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-    #define WVM_HTONLL(x) (((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((uint32_t)((x) >> 32)))
-    #define WVM_NTOHLL(x) WVM_HTONLL(x)
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    #define WVM_HTONLL(x) __builtin_bswap64((unsigned long long)(x))
+    #define WVM_NTOHLL(x) __builtin_bswap64((unsigned long long)(x))
 #else
     #define WVM_HTONLL(x) (x)
     #define WVM_NTOHLL(x) (x)
@@ -1781,6 +1787,7 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
 
 #ifdef __KERNEL__
     #include <linux/spinlock.h>
+    #include <linux/delay.h>
     #include <linux/string.h>
     
     typedef spinlock_t pthread_mutex_t;
@@ -1792,6 +1799,13 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
     #define pthread_spin_init(l, a)  spin_lock_init(l)
     #define pthread_spin_lock(l)     spin_lock(l)
     #define pthread_spin_unlock(l)   spin_unlock(l)
+
+    #define pthread_rwlock_t         spinlock_t
+    #define pthread_rwlock_init(l, a) spin_lock_init(l)
+    #define pthread_rwlock_rdlock(l) spin_lock_bh(l)
+    #define pthread_rwlock_wrlock(l) spin_lock_bh(l)
+    #define pthread_rwlock_unlock(l) spin_unlock_bh(l)
+    #define usleep(us)               usleep_range((us), (us) + 100)
     // --------------------
 
 #else
@@ -1823,9 +1837,23 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
     #define free(ptr) kfree(ptr)
 #endif
 
-#include <stdatomic.h> 
-#include <stdbool.h>
-#include <unistd.h>
+#ifdef __KERNEL__
+    #include <linux/types.h>
+    typedef int atomic_bool;
+    typedef int atomic_int;
+    typedef long atomic_long;
+    #ifndef ATOMIC_VAR_INIT
+    #define ATOMIC_VAR_INIT(v) (v)
+    #endif
+    #define atomic_fetch_add(ptr, v) __sync_fetch_and_add((ptr), (v))
+    #define atomic_load(ptr) __atomic_load_n((ptr), __ATOMIC_SEQ_CST)
+    #define atomic_store(ptr, v) __atomic_store_n((ptr), (v), __ATOMIC_SEQ_CST)
+    #define atomic_exchange(ptr, v) __atomic_exchange_n((ptr), (v), __ATOMIC_SEQ_CST)
+#else
+    #include <stdatomic.h>
+    #include <stdbool.h>
+    #include <unistd.h>
+#endif
 
 // --- 全局状态 ---
 struct dsm_driver_ops *g_ops = NULL;
@@ -1842,7 +1870,7 @@ static struct {
     int curr_offset;
     uint32_t last_gateway_id; 
     pthread_mutex_t lock;
-} g_gossip_agg = { .curr_offset = 0, .lock = PTHREAD_MUTEX_INITIALIZER };
+} g_gossip_agg = { .curr_offset = 0 };
 
 #define MAX_LOCAL_VIEW 1024  // 本地感知的邻居上限
 #define GOSSIP_INTERVAL_US 500000 // 500ms 心跳一次
@@ -1860,7 +1888,7 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 
 // --- 目录表定义 ---
 #ifdef __KERNEL__
-#define DIR_TABLE_SIZE (1024 * 1024 * 64) // Kernel path keeps full table
+#define DIR_TABLE_SIZE (1024 * 4) // Keep kernel smoke-test footprint bounded
 #else
 #define DIR_TABLE_SIZE (1024 * 64) // User-mode smoke test friendly size
 #endif
@@ -2036,7 +2064,7 @@ typedef struct {
 // 局部拓扑视图：无中心架构的核心
 static peer_entry_t g_peer_view[MAX_LOCAL_VIEW];
 static int g_peer_count = 0;
-static pthread_rwlock_t g_view_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_view_lock;
 
 // 自治周期控制
 // g_curr_epoch moved earlier to satisfy forward references
@@ -2047,7 +2075,7 @@ static atomic_int g_peers_at_next_epoch = 0; // 观测到处于 E+1 的邻居计
 #define HASH_RING_SIZE 4096 
 // 这个表存储：Slot -> NodeID 的映射
 static uint32_t g_hash_ring_cache[HASH_RING_SIZE];
-static pthread_rwlock_t g_ring_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_ring_lock;
 
 /* 
  * [物理意图] 当集群发生节点加减（扩容/宕机）时，在后台重建 P2P 拓扑的逻辑环，复杂度 O(RingSize * PeerCount)，但在后台运行，不阻塞热路径
@@ -2133,7 +2161,11 @@ uint32_t wvm_get_storage_node_id(uint64_t lba) {
 
 /* --- 逻辑入口：处理接收到的心跳与视图更新 --- */
 
+#ifdef __KERNEL__
+static inline void wvm_notify_kernel_epoch(uint32_t epoch) { (void)epoch; }
+#else
 extern void wvm_notify_kernel_epoch(uint32_t epoch);
+#endif
 
 /* 
  * [物理意图] 接收 Gossip 消息，更新本地对 P2P 邻居的存活状态与纪元（Epoch）认知。
@@ -2396,6 +2428,10 @@ int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
     for (int i = 0; i < LOCK_SHARDS; i++) {
         pthread_mutex_init(&g_dir_table_locks[i], NULL); 
     }
+
+    pthread_mutex_init(&g_gossip_agg.lock, NULL);
+    pthread_rwlock_init(&g_view_lock, NULL);
+    pthread_rwlock_init(&g_ring_lock, NULL);
     
     // 分片广播队列在定义处进行静态零初始化；此处不重复初始化。
     
@@ -3353,15 +3389,8 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
 
             // 3. [执行] 调用后端提供的物理执行接口
             // 逻辑核心不直接操作内存，而是通过 ops 传导
-            #ifdef __KERNEL__
-                // 内核态直接调用 backend 函数
-                extern void handle_kernel_rpc_batch(void *payload, uint32_t payload_len);
-                handle_kernel_rpc_batch(payload, payload_len);
-            #else
-                // 用户态直接调用 backend 函数
-                extern void handle_rpc_batch_execution(void *payload, uint32_t payload_len);
-                handle_rpc_batch_execution(payload, payload_len);
-            #endif
+            // 后端执行入口（内核/用户态均由对应实现接管）
+            handle_rpc_batch_execution(payload, payload_len);
 
             // 4. [自治演进] 观测者模式：Prophet 指令也算是一次活跃心跳
             update_local_topology_view(src_id, src_epoch, src_state, NULL, 0);
@@ -3504,6 +3533,7 @@ void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/udp.h>
+#include <linux/ip.h>
 #include <linux/socket.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -3528,6 +3558,7 @@ void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg
 #include <linux/rmap.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <linux/cpu.h>
 
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_protocol.h"
@@ -3573,8 +3604,6 @@ static struct address_space *g_mapping = NULL;
 #define BITS_PER_CPU_ID 16
 #define MAX_IDS_PER_CPU (1 << BITS_PER_CPU_ID) 
 #define CPU_ID_SHIFT    16                     
-#define MAX_SUPPORTED_CPUS 1024               
-#define TOTAL_MAX_REQS  (MAX_SUPPORTED_CPUS * MAX_IDS_PER_CPU)
 
 struct id_pool_t {
     uint32_t *ids;
@@ -3593,6 +3622,9 @@ struct req_ctx_t {
     struct task_struct *waiter; // [New] 记录等待的任务 (用于调试或唤醒检查)
 };
 static struct req_ctx_t *g_req_ctx = NULL;
+// Runtime-sized: nr_cpu_ids * MAX_IDS_PER_CPU. The original fixed sizing
+// (1024 * 65536) is too large for most test environments and can stall insmod.
+static size_t g_req_ctx_count = 0;
 
 // [V29 Final Fix] 内核态页面元数据
 // 用于在 Radix Tree 中同时存储物理页指针和版本号
@@ -3710,12 +3742,11 @@ static void* k_alloc_packet(size_t size, int atomic) {
 }
 static void k_free_packet(void *ptr) {
     if (!ptr) return;
-    struct page *page = virt_to_head_page(ptr);
-    if (page && PageSlab(page) && page->slab_cache == wvm_pkt_cache) {
-        kmem_cache_free(wvm_pkt_cache, ptr);
-    } else {
-        kfree(ptr);
-    }
+    /*
+     * Kernel >= 6.x no longer exposes slab cache pointer in struct page.
+     * kfree() can free both kmalloc() and slab objects, and is sufficient here.
+     */
+    kfree(ptr);
 }
 static void k_fetch_page(uint64_t gpa, void *buf) {} // Deprecated by logic_core
 
@@ -3750,11 +3781,12 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
     struct id_pool_t *pool = this_cpu_ptr(&g_id_pool);
 
     spin_lock_irqsave(&pool->lock, flags);
+    if (unlikely(!pool->ids)) goto out;
     if (pool->tail != pool->head) {
         uint32_t raw_idx = pool->ids[pool->head & (MAX_IDS_PER_CPU - 1)];
         pool->head++;
         uint32_t combined_idx = ((uint32_t)cpu << CPU_ID_SHIFT) | raw_idx;
-        if (likely(combined_idx < TOTAL_MAX_REQS)) {
+        if (likely((size_t)combined_idx < g_req_ctx_count)) {
             g_req_ctx[combined_idx].generation++;
             if (g_req_ctx[combined_idx].generation == 0) g_req_ctx[combined_idx].generation = 1;
             id = ((uint64_t)g_req_ctx[combined_idx].generation << 32) | combined_idx;
@@ -3763,6 +3795,7 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
             smp_wmb(); 
         } else { pool->head--; }
     }
+out:
     spin_unlock_irqrestore(&pool->lock, flags);
     put_cpu();
     return id;
@@ -3776,13 +3809,14 @@ static void k_free_req_id(uint64_t full_id) {
     uint32_t raw_idx = combined_idx & (MAX_IDS_PER_CPU - 1);
     struct id_pool_t *pool;
 
-    if (unlikely(combined_idx >= TOTAL_MAX_REQS || owner_cpu >= nr_cpu_ids)) return;
+    if (unlikely((size_t)combined_idx >= g_req_ctx_count || owner_cpu >= nr_cpu_ids)) return;
     if (g_req_ctx[combined_idx].generation != generation) return; 
 
     xchg(&g_req_ctx[combined_idx].rx_buffer, NULL);
     WRITE_ONCE(g_req_ctx[combined_idx].done, 0);
 
     pool = per_cpu_ptr(&g_id_pool, owner_cpu);
+    if (unlikely(!pool->ids)) return;
     spin_lock_irqsave(&pool->lock, flags);
     pool->ids[pool->tail & (MAX_IDS_PER_CPU - 1)] = raw_idx;
     pool->tail++;
@@ -3791,7 +3825,7 @@ static void k_free_req_id(uint64_t full_id) {
 
 static int k_check_req_status(uint64_t full_id) {
     uint32_t combined_idx = (uint32_t)(full_id & 0xFFFFFFFF);
-    if (combined_idx >= TOTAL_MAX_REQS) return -1;
+    if ((size_t)combined_idx >= g_req_ctx_count) return -1;
     if (READ_ONCE(g_req_ctx[combined_idx].done)) { smp_rmb(); return 1; }
     return 0;
 }
@@ -3830,7 +3864,9 @@ static int raw_kernel_send(void *data, int len, uint32_t target_id) {
  * [后果] 保证了系统在“内存洪流”中依然能及时响应心跳与版本确认包，防止了由于网络拥塞导致的误判定节点下线。
  */
 static int tx_worker_thread_fn(void *data) {
-    struct tx_slot_t slot;
+    /* Large TX slots (up to 64KB) cannot live on kernel stack. */
+    struct tx_slot_t *slot = kvzalloc(sizeof(*slot), GFP_KERNEL);
+    if (!slot) return -ENOMEM;
     while (!kthread_should_stop()) {
         wait_event_interruptible(g_tx_wq, 
             atomic_read(&g_fast_ring.pending_count) > 0 || 
@@ -3843,7 +3879,7 @@ static int tx_worker_thread_fn(void *data) {
             int found = 0;
             spin_lock_bh(&g_fast_ring.lock);
             if (g_fast_ring.head != g_fast_ring.tail) {
-                memcpy(&slot, &g_fast_ring.slots[g_fast_ring.head], sizeof(slot));
+                memcpy(slot, &g_fast_ring.slots[g_fast_ring.head], sizeof(*slot));
                 g_fast_ring.head = (g_fast_ring.head + 1) % TX_RING_SIZE;
                 atomic_dec(&g_fast_ring.pending_count);
                 found = 1;
@@ -3852,11 +3888,11 @@ static int tx_worker_thread_fn(void *data) {
             
             if (found) { 
                 // [V29] CRC Calculation offloaded to worker thread
-                struct wvm_header *hdr = (struct wvm_header *)slot.data;
+                struct wvm_header *hdr = (struct wvm_header *)slot->data;
                 hdr->crc32 = 0;
-                hdr->crc32 = htonl(calculate_crc32(slot.data, slot.len));
+                hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot.data, slot.len, slot.target_id); 
+                raw_kernel_send(slot->data, slot->len, slot->target_id); 
                 cond_resched(); 
             }
         }
@@ -3867,7 +3903,7 @@ static int tx_worker_thread_fn(void *data) {
             int found = 0;
             spin_lock_bh(&g_slow_ring.lock);
             if (g_slow_ring.head != g_slow_ring.tail) {
-                memcpy(&slot, &g_slow_ring.slots[g_slow_ring.head], sizeof(slot));
+                memcpy(slot, &g_slow_ring.slots[g_slow_ring.head], sizeof(*slot));
                 g_slow_ring.head = (g_slow_ring.head + 1) % TX_RING_SIZE;
                 atomic_dec(&g_slow_ring.pending_count);
                 found = 1;
@@ -3876,17 +3912,18 @@ static int tx_worker_thread_fn(void *data) {
             
             if (found) {
                 // [V29] CRC Calculation
-                struct wvm_header *hdr = (struct wvm_header *)slot.data;
+                struct wvm_header *hdr = (struct wvm_header *)slot->data;
                 hdr->crc32 = 0;
-                hdr->crc32 = htonl(calculate_crc32(slot.data, slot.len));
+                hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot.data, slot.len, slot.target_id);
+                raw_kernel_send(slot->data, slot->len, slot->target_id);
             }
             // Preempt if fast packet arrives
             if (atomic_read(&g_fast_ring.pending_count) > 0) break;
         }
         k_touch_watchdog();
     }
+    kvfree(slot);
     return 0;
 }
 
@@ -4637,7 +4674,7 @@ static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_
     if (type == MSG_MEM_ACK || type == MSG_VCPU_EXIT) {
         uint64_t rid = WVM_NTOHLL(hdr->req_id);
         uint32_t combined_idx = (uint32_t)(rid & 0xFFFFFFFF);
-        if (combined_idx < TOTAL_MAX_REQS) {
+        if ((size_t)combined_idx < g_req_ctx_count) {
             struct req_ctx_t *ctx = &g_req_ctx[combined_idx];
             // 检查 Generation 防止 ABA
             if ((rid >> 32) == ctx->generation) {
@@ -4880,11 +4917,16 @@ static int __init wavevm_init(void) {
     spin_lock_init(&g_diff_lock);
     init_rwsem(&g_mapping_sem);
 
-    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * TOTAL_MAX_REQS);
+    /*
+     * Use online CPU count for sizing/initialization to keep module load feasible
+     * on kernels with very large CONFIG_NR_CPUS.
+     */
+    g_req_ctx_count = (size_t)num_online_cpus() * (size_t)MAX_IDS_PER_CPU;
+    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * g_req_ctx_count);
     if (!g_req_ctx) return -ENOMEM;
-    for (int i = 0; i < TOTAL_MAX_REQS; i++) init_waitqueue_head(&g_req_ctx[i].wq);
+    for (size_t i = 0; i < g_req_ctx_count; i++) init_waitqueue_head(&g_req_ctx[i].wq);
 
-    for_each_possible_cpu(cpu) {
+    for_each_online_cpu(cpu) {
         struct id_pool_t *pool = per_cpu_ptr(&g_id_pool, cpu);
         spin_lock_init(&pool->lock);
         pool->ids = vzalloc(sizeof(uint32_t) * MAX_IDS_PER_CPU);
