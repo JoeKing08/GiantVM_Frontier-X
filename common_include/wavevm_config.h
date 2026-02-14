@@ -25,9 +25,6 @@
 #define WVM_SLAVE_BITS 20
 #endif
 
-#include <endian.h>
-#include <arpa/inet.h>
-
 // --- 网络字节序转换宏 ---
 /*
  * [跨架构兼容性] 64位整数的主机序(Host)到网络序(Network)转换。
@@ -36,9 +33,9 @@
  * 2. 这里的实现兼容了 x86 (Little-Endian) 和其他架构。
  * 3. 若不转换，跨架构通信时 GPA 地址会解析错误，导致读写错误的物理内存。
  */
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-    #define WVM_HTONLL(x) (((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((uint32_t)((x) >> 32)))
-    #define WVM_NTOHLL(x) WVM_HTONLL(x)
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    #define WVM_HTONLL(x) __builtin_bswap64((unsigned long long)(x))
+    #define WVM_NTOHLL(x) __builtin_bswap64((unsigned long long)(x))
 #else
     #define WVM_HTONLL(x) (x)
     #define WVM_NTOHLL(x) (x)

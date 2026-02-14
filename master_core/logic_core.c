@@ -19,6 +19,7 @@
 
 #ifdef __KERNEL__
     #include <linux/spinlock.h>
+    #include <linux/delay.h>
     #include <linux/string.h>
     
     typedef spinlock_t pthread_mutex_t;
@@ -30,6 +31,13 @@
     #define pthread_spin_init(l, a)  spin_lock_init(l)
     #define pthread_spin_lock(l)     spin_lock(l)
     #define pthread_spin_unlock(l)   spin_unlock(l)
+
+    #define pthread_rwlock_t         spinlock_t
+    #define pthread_rwlock_init(l, a) spin_lock_init(l)
+    #define pthread_rwlock_rdlock(l) spin_lock_bh(l)
+    #define pthread_rwlock_wrlock(l) spin_lock_bh(l)
+    #define pthread_rwlock_unlock(l) spin_unlock_bh(l)
+    #define usleep(us)               usleep_range((us), (us) + 100)
     // --------------------
 
 #else
@@ -61,9 +69,23 @@
     #define free(ptr) kfree(ptr)
 #endif
 
-#include <stdatomic.h> 
-#include <stdbool.h>
-#include <unistd.h>
+#ifdef __KERNEL__
+    #include <linux/types.h>
+    typedef int atomic_bool;
+    typedef int atomic_int;
+    typedef long atomic_long;
+    #ifndef ATOMIC_VAR_INIT
+    #define ATOMIC_VAR_INIT(v) (v)
+    #endif
+    #define atomic_fetch_add(ptr, v) __sync_fetch_and_add((ptr), (v))
+    #define atomic_load(ptr) __atomic_load_n((ptr), __ATOMIC_SEQ_CST)
+    #define atomic_store(ptr, v) __atomic_store_n((ptr), (v), __ATOMIC_SEQ_CST)
+    #define atomic_exchange(ptr, v) __atomic_exchange_n((ptr), (v), __ATOMIC_SEQ_CST)
+#else
+    #include <stdatomic.h>
+    #include <stdbool.h>
+    #include <unistd.h>
+#endif
 
 // --- 全局状态 ---
 struct dsm_driver_ops *g_ops = NULL;
@@ -80,7 +102,7 @@ static struct {
     int curr_offset;
     uint32_t last_gateway_id; 
     pthread_mutex_t lock;
-} g_gossip_agg = { .curr_offset = 0, .lock = PTHREAD_MUTEX_INITIALIZER };
+} g_gossip_agg = { .curr_offset = 0 };
 
 #define MAX_LOCAL_VIEW 1024  // 本地感知的邻居上限
 #define GOSSIP_INTERVAL_US 500000 // 500ms 心跳一次
@@ -98,7 +120,7 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 
 // --- 目录表定义 ---
 #ifdef __KERNEL__
-#define DIR_TABLE_SIZE (1024 * 1024 * 64) // Kernel path keeps full table
+#define DIR_TABLE_SIZE (1024 * 64) // Keep kernel smoke-test footprint bounded
 #else
 #define DIR_TABLE_SIZE (1024 * 64) // User-mode smoke test friendly size
 #endif
@@ -274,7 +296,7 @@ typedef struct {
 // 局部拓扑视图：无中心架构的核心
 static peer_entry_t g_peer_view[MAX_LOCAL_VIEW];
 static int g_peer_count = 0;
-static pthread_rwlock_t g_view_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_view_lock;
 
 // 自治周期控制
 // g_curr_epoch moved earlier to satisfy forward references
@@ -285,7 +307,7 @@ static atomic_int g_peers_at_next_epoch = 0; // 观测到处于 E+1 的邻居计
 #define HASH_RING_SIZE 4096 
 // 这个表存储：Slot -> NodeID 的映射
 static uint32_t g_hash_ring_cache[HASH_RING_SIZE];
-static pthread_rwlock_t g_ring_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_ring_lock;
 
 /* 
  * [物理意图] 当集群发生节点加减（扩容/宕机）时，在后台重建 P2P 拓扑的逻辑环，复杂度 O(RingSize * PeerCount)，但在后台运行，不阻塞热路径
@@ -371,7 +393,11 @@ uint32_t wvm_get_storage_node_id(uint64_t lba) {
 
 /* --- 逻辑入口：处理接收到的心跳与视图更新 --- */
 
+#ifdef __KERNEL__
+static inline void wvm_notify_kernel_epoch(uint32_t epoch) { (void)epoch; }
+#else
 extern void wvm_notify_kernel_epoch(uint32_t epoch);
+#endif
 
 /* 
  * [物理意图] 接收 Gossip 消息，更新本地对 P2P 邻居的存活状态与纪元（Epoch）认知。
@@ -634,6 +660,10 @@ int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
     for (int i = 0; i < LOCK_SHARDS; i++) {
         pthread_mutex_init(&g_dir_table_locks[i], NULL); 
     }
+
+    pthread_mutex_init(&g_gossip_agg.lock, NULL);
+    pthread_rwlock_init(&g_view_lock, NULL);
+    pthread_rwlock_init(&g_ring_lock, NULL);
     
     // 分片广播队列在定义处进行静态零初始化；此处不重复初始化。
     
@@ -1591,15 +1621,8 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
 
             // 3. [执行] 调用后端提供的物理执行接口
             // 逻辑核心不直接操作内存，而是通过 ops 传导
-            #ifdef __KERNEL__
-                // 内核态直接调用 backend 函数
-                extern void handle_kernel_rpc_batch(void *payload, uint32_t payload_len);
-                handle_kernel_rpc_batch(payload, payload_len);
-            #else
-                // 用户态直接调用 backend 函数
-                extern void handle_rpc_batch_execution(void *payload, uint32_t payload_len);
-                handle_rpc_batch_execution(payload, payload_len);
-            #endif
+            // 后端执行入口（内核/用户态均由对应实现接管）
+            handle_rpc_batch_execution(payload, payload_len);
 
             // 4. [自治演进] 观测者模式：Prophet 指令也算是一次活跃心跳
             update_local_topology_view(src_id, src_epoch, src_state, NULL, 0);

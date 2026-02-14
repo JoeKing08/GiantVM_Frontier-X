@@ -21,6 +21,7 @@
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/udp.h>
+#include <linux/ip.h>
 #include <linux/socket.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>

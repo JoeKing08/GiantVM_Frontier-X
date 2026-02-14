@@ -3,7 +3,21 @@
 
 #include "unified_driver.h"
 #include "../common_include/wavevm_protocol.h"
+#ifdef __KERNEL__
+#include <linux/in.h>
+#else
 #include <stdint.h>
+#include <netinet/in.h>
+#endif
+
+#ifndef MAKE_VERSION
+#define MAKE_VERSION(epoch, counter) (((uint64_t)(epoch) << 32) | (counter))
+#endif
+#ifndef GET_COUNTER
+#define GET_COUNTER(version) ((uint32_t)((version) & 0xFFFFFFFF))
+#endif
+
+extern int g_my_node_id;
 
 // --- 初始化与配置 ---
 int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint);
@@ -31,8 +45,11 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
 
 // --- 路由接口 ---
 uint32_t wvm_get_directory_node_id(uint64_t gpa);
+uint32_t wvm_get_storage_node_id(uint64_t lba);
 
 void update_local_topology_view(uint32_t src_id, uint32_t src_epoch, uint8_t src_state, struct sockaddr_in *src_addr, uint16_t src_ctrl_port);
+void wvm_logic_update_local_version(uint64_t gpa);
+void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg_type);
 
 // 计算任务路由 (V27 遗留，用于 RPC 调度)
 uint32_t wvm_get_compute_slave_id(int vcpu_index);

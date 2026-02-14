@@ -1,5 +1,13 @@
 /* 文件位置：common_include/crc32.h */
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#include <linux/stddef.h>
+#else
+#include <stdint.h>
+#include <stddef.h>
+#endif
+
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
 static inline uint32_t calculate_crc32(const void* data, size_t length) {
@@ -21,9 +29,6 @@ static inline uint32_t calculate_crc32(const void* data, size_t length) {
 
 #ifndef CRC32_H
 #define CRC32_H
-
-#include <stdint.h>
-#include <stddef.h>
 
 static uint32_t crc32_table[256];
 static int crc32_table_inited = 0;
