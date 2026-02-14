@@ -91,8 +91,6 @@ static struct address_space *g_mapping = NULL;
 #define BITS_PER_CPU_ID 16
 #define MAX_IDS_PER_CPU (1 << BITS_PER_CPU_ID) 
 #define CPU_ID_SHIFT    16                     
-#define MAX_SUPPORTED_CPUS 1024               
-#define TOTAL_MAX_REQS  (MAX_SUPPORTED_CPUS * MAX_IDS_PER_CPU)
 
 struct id_pool_t {
     uint32_t *ids;
@@ -111,6 +109,9 @@ struct req_ctx_t {
     struct task_struct *waiter; // [New] 记录等待的任务 (用于调试或唤醒检查)
 };
 static struct req_ctx_t *g_req_ctx = NULL;
+// Runtime-sized: nr_cpu_ids * MAX_IDS_PER_CPU. The original fixed sizing
+// (1024 * 65536) is too large for most test environments and can stall insmod.
+static size_t g_req_ctx_count = 0;
 
 // [V29 Final Fix] 内核态页面元数据
 // 用于在 Radix Tree 中同时存储物理页指针和版本号
@@ -271,7 +272,7 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
         uint32_t raw_idx = pool->ids[pool->head & (MAX_IDS_PER_CPU - 1)];
         pool->head++;
         uint32_t combined_idx = ((uint32_t)cpu << CPU_ID_SHIFT) | raw_idx;
-        if (likely(combined_idx < TOTAL_MAX_REQS)) {
+        if (likely((size_t)combined_idx < g_req_ctx_count)) {
             g_req_ctx[combined_idx].generation++;
             if (g_req_ctx[combined_idx].generation == 0) g_req_ctx[combined_idx].generation = 1;
             id = ((uint64_t)g_req_ctx[combined_idx].generation << 32) | combined_idx;
@@ -293,7 +294,7 @@ static void k_free_req_id(uint64_t full_id) {
     uint32_t raw_idx = combined_idx & (MAX_IDS_PER_CPU - 1);
     struct id_pool_t *pool;
 
-    if (unlikely(combined_idx >= TOTAL_MAX_REQS || owner_cpu >= nr_cpu_ids)) return;
+    if (unlikely((size_t)combined_idx >= g_req_ctx_count || owner_cpu >= nr_cpu_ids)) return;
     if (g_req_ctx[combined_idx].generation != generation) return; 
 
     xchg(&g_req_ctx[combined_idx].rx_buffer, NULL);
@@ -308,7 +309,7 @@ static void k_free_req_id(uint64_t full_id) {
 
 static int k_check_req_status(uint64_t full_id) {
     uint32_t combined_idx = (uint32_t)(full_id & 0xFFFFFFFF);
-    if (combined_idx >= TOTAL_MAX_REQS) return -1;
+    if ((size_t)combined_idx >= g_req_ctx_count) return -1;
     if (READ_ONCE(g_req_ctx[combined_idx].done)) { smp_rmb(); return 1; }
     return 0;
 }
@@ -1154,7 +1155,7 @@ static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_
     if (type == MSG_MEM_ACK || type == MSG_VCPU_EXIT) {
         uint64_t rid = WVM_NTOHLL(hdr->req_id);
         uint32_t combined_idx = (uint32_t)(rid & 0xFFFFFFFF);
-        if (combined_idx < TOTAL_MAX_REQS) {
+        if ((size_t)combined_idx < g_req_ctx_count) {
             struct req_ctx_t *ctx = &g_req_ctx[combined_idx];
             // 检查 Generation 防止 ABA
             if ((rid >> 32) == ctx->generation) {
@@ -1397,9 +1398,10 @@ static int __init wavevm_init(void) {
     spin_lock_init(&g_diff_lock);
     init_rwsem(&g_mapping_sem);
 
-    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * TOTAL_MAX_REQS);
+    g_req_ctx_count = (size_t)nr_cpu_ids * (size_t)MAX_IDS_PER_CPU;
+    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * g_req_ctx_count);
     if (!g_req_ctx) return -ENOMEM;
-    for (int i = 0; i < TOTAL_MAX_REQS; i++) init_waitqueue_head(&g_req_ctx[i].wq);
+    for (size_t i = 0; i < g_req_ctx_count; i++) init_waitqueue_head(&g_req_ctx[i].wq);
 
     for_each_possible_cpu(cpu) {
         struct id_pool_t *pool = per_cpu_ptr(&g_id_pool, cpu);
