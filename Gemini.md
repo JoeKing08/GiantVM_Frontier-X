@@ -1114,7 +1114,6 @@ sysctl -w net.core.netdev_max_backlog=10000 > /dev/null
 echo "[+] Network device backlog queue increased."
 echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 ```
-
 ---
 
 ## Step 1: 基础设施定义 (Infrastructure)
@@ -1217,7 +1216,6 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 
 #endif // WAVEVM_CONFIG_H
 ```
-
 **文件**: `common_include/platform_defs.h`
 
 ```c
@@ -1246,7 +1244,6 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 
 #endif // PLATFORM_DEFS_H
 ```
-
 **文件**: `common_include/wavevm_protocol.h`
 
 ```c
@@ -1545,7 +1542,6 @@ extern int g_ctrl_port;
 
 #endif // WAVEVM_PROTOCOL_H
 ```
-
 **文件**: `common_include/wavevm_ioctl.h`
 
 ```c
@@ -1599,11 +1595,18 @@ struct wvm_ioctl_mem_layout {
 
 #endif // WAVEVM_IOCTL_H
 ```
-
 **文件**: `common_include/crc32.h`
 
 ```c
 /* 文件位置：common_include/crc32.h */
+
+#ifdef __KERNEL__
+#include <linux/types.h>
+#include <linux/stddef.h>
+#else
+#include <stdint.h>
+#include <stddef.h>
+#endif
 
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
@@ -1626,9 +1629,6 @@ static inline uint32_t calculate_crc32(const void* data, size_t length) {
 
 #ifndef CRC32_H
 #define CRC32_H
-
-#include <stdint.h>
-#include <stddef.h>
 
 static uint32_t crc32_table[256];
 static int crc32_table_inited = 0;
@@ -1664,7 +1664,6 @@ static inline uint32_t calculate_crc32(const void* data, size_t length) {
 #endif // CRC32_H
 #endif // __SSE4_2__
 ```
-
 ---
 
 ## Step 2: 统一驱动接口 (Unified Driver)
@@ -1709,7 +1708,6 @@ struct dsm_driver_ops {
 extern struct dsm_driver_ops *g_ops;
 #endif
 ```
-
 ---
 
 ## Step 3: 纯逻辑核心 (Logic Core)
@@ -1722,7 +1720,21 @@ extern struct dsm_driver_ops *g_ops;
 
 #include "unified_driver.h"
 #include "../common_include/wavevm_protocol.h"
+#ifdef __KERNEL__
+#include <linux/in.h>
+#else
 #include <stdint.h>
+#include <netinet/in.h>
+#endif
+
+#ifndef MAKE_VERSION
+#define MAKE_VERSION(epoch, counter) (((uint64_t)(epoch) << 32) | (counter))
+#endif
+#ifndef GET_COUNTER
+#define GET_COUNTER(version) ((uint32_t)((version) & 0xFFFFFFFF))
+#endif
+
+extern int g_my_node_id;
 
 // --- 初始化与配置 ---
 int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint);
@@ -1750,8 +1762,11 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
 
 // --- 路由接口 ---
 uint32_t wvm_get_directory_node_id(uint64_t gpa);
+uint32_t wvm_get_storage_node_id(uint64_t lba);
 
 void update_local_topology_view(uint32_t src_id, uint32_t src_epoch, uint8_t src_state, struct sockaddr_in *src_addr, uint16_t src_ctrl_port);
+void wvm_logic_update_local_version(uint64_t gpa);
+void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg_type);
 
 // 计算任务路由 (V27 遗留，用于 RPC 调度)
 uint32_t wvm_get_compute_slave_id(int vcpu_index);
@@ -1762,7 +1777,6 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
 
 #endif // LOGIC_CORE_H
 ```
-
 **文件**: `master_core/logic_core.c`
 
 ```c
@@ -3502,7 +3516,6 @@ void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg
     pthread_rwlock_unlock(&g_view_lock);
 }
 ```
-
 ---
 
 ## Step 4: 内核后端实现与内核构建脚本 (Kernel Backend & Kernel Build Script)
@@ -4995,7 +5008,6 @@ module_init(wavevm_init);
 module_exit(wavevm_exit);
 MODULE_LICENSE("GPL");
 ```
-
 **文件**: `master_core/Kbuild`
 
 ```makefile
@@ -5008,9 +5020,8 @@ wavevm-y := kernel_backend.o logic_core.o
 
 # 添加公共头文件路径
 # $(src) 是内核构建系统提供的变量，指向当前目录
-ccflags-y := -I$(src)/../common_include
+ccflags-y := -I$(src)/../common_include -std=gnu11
 ```
-
 ---
 
 ## Step 5: 用户态后端实现 (User Backend)
@@ -6003,7 +6014,6 @@ int user_backend_init(int my_node_id, int port) {
     return 0;
 }
 ```
-
 **文件**: `master_core/main_wrapper.c`
 
 ```c
@@ -6625,7 +6635,6 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
-
 **文件**: `master_core/Makefile_User`
 
 ```makefile
@@ -6642,7 +6651,6 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
-
 ---
 
 ## Step 6: Slave 守护进程 (Slave Daemon)
@@ -7788,7 +7796,6 @@ typedef struct UT_hash_handle {
 
 #endif /* UTHASH_H */
 ```
-
 **文件**: `slave_daemon/slave_hybrid.c`
 
 ```c
@@ -8854,7 +8861,6 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
-
 **文件**: `slave_daemon/slave_vfio.h`
 
 ```c
@@ -8907,7 +8913,6 @@ void wvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr);
 
 #endif
 ```
-
 **文件**: `slave_daemon/slave_vfio.c`
 
 ```c
@@ -9306,7 +9311,6 @@ void wvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
     close(epfd);
 }
 ```
-
 **文件**: `slave_daemon/Makefile`
 
 ```makefile
@@ -9323,7 +9327,6 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
-
 ---
 
 ## Step 7: 控制面工具 (Control Tool)
@@ -9343,7 +9346,6 @@ $(TARGET): main.c
 clean:
 	rm -f $(TARGET)
 ```
-
 **文件**: `ctl_tool/main.c`
 
 ```c
@@ -9572,7 +9574,6 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
-
 ---
 
 ## Step 8: QEMU 5.2.0 适配 (Frontend)
@@ -9656,7 +9657,6 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->idt.limit = ctx->idt_limit;
 }
 ```
-
 **文件**: `qemu_patch/accel/wavevm/wavevm-all.c`
 
 ```c
@@ -10546,7 +10546,6 @@ int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write) {
     return ret; 
 }
 ```
-
 **文件**: `qemu_patch/accel/wavevm/wavevm-cpu.c`
 
 ```c
@@ -10966,7 +10965,6 @@ void wavevm_start_vcpu_thread(CPUState *cpu) {
     qemu_thread_create(cpu->thread, thread_name, wavevm_cpu_thread_fn, cpu, QEMU_THREAD_JOINABLE);
 }
 ```
-
 **文件**: `qemu_patch/accel/wavevm/wavevm-user-mem.c`
 
 ```c
@@ -12200,7 +12198,6 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
     mprotect(g_ram_base, g_ram_size, PROT_NONE);
 }
 ```
-
 **文件**: `qemu_patch/hw/wavevm/wavevm_mem.c`
 
 ```c
@@ -12242,7 +12239,6 @@ void wavevm_setup_memory_region(MemoryRegion *mr, uint64_t size, int fd) {
     fprintf(stderr, "WaveVM: Mapped %lu bytes (Dirty Logging ON).\n", size);
 }
 ```
-
 **文件**: `qemu_patch/hw/wavevm/wavevm-gpu-stub.c`
 
 ```c
@@ -12497,7 +12493,6 @@ static void wvm_gpu_stub_register_types(void) {
 }
 type_init(wvm_gpu_stub_register_types)
 ```
-
 **文件**: `qemu_patch/hw/wavevm/wavevm-block-hook.c`
 
 ```c
@@ -12538,7 +12533,6 @@ static int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_wr
     return ret; // 0=Intercepted & Success, -1=Passthrough
 }
 ```
-
 **文件**: `qemu_patch/virtio-blk.diff`
 
 ```diff
@@ -12569,7 +12563,6 @@ static int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_wr
          virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
          return 0;
 ```
-
 ---
 
 ## Step 9: 优化的网关 (Gateway)
@@ -12612,7 +12605,6 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
-
 **文件**: `gateway_service/aggregator.h` (接口定义)
 
 ```c
@@ -12664,7 +12656,6 @@ void flush_all_buffers(void);
 
 #endif // AGGREGATOR_H
 ```
-
 **文件**: `gateway_service/aggregator.c`
 
 ```c
@@ -13217,7 +13208,6 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
 
     return 0;}
 ```
-
 **文件**: `gateway_service/Makefile`
 
 ```c
@@ -13235,7 +13225,6 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
-
 ---
 
 ### ✅ 全局完成确认 (Global Completion Confirmation)
