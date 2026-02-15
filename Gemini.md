@@ -1,4 +1,6 @@
-﻿这份文档是 **WaveVM "Wavelet" V30.0** 的最高技术指导纲领，标志着分布式虚拟化从“实验性仿真”向“工业级生产底座”的终极跨越。V30.0 不仅仅是一个版本号的更迭，它是对现代计算机体系结构中“算力”与“数据”关系的重新物理定义。
+## Document
+
+这份文档是 **WaveVM "Wavelet" V30.0** 的最高技术指导纲领，标志着分布式虚拟化从“实验性仿真”向“工业级生产底座”的终极跨越。V30.0 不仅仅是一个版本号的更迭，它是对现代计算机体系结构中“算力”与“数据”关系的重新物理定义。
 
 #### **🕰️ 历史的坍缩与演进：从 V27 到 V30.0 的量子跃迁**
 
@@ -62,7 +64,7 @@ V30.0 不再将物理计算节点视为单一的进程，而是定义为由 **�
             |                                   | (127.0.0.1)     |
             |                                   v                 |
             |                       [ Slave Daemon (Exec) ] <-----+
-            |                       ( Port: 9001 - The MUSCLE )
+            |                       ( Port: 9005 - The MUSCLE )
             |                       ( - KVM Stateless Run     )
             +---------------------> ( - Block IO (O_DIRECT)   )
                                     ( - Dirty Sync (MPSC)     )
@@ -288,9 +290,7 @@ V30.0 的部署继承了 V28 的**分形蜂群（Fractal Swarm）**理念，但�
     # 2. 定义本节点共享内存标识（用于防止单机部署时内存重叠坍缩，多机部署可不使用该项设置，使用默认的 /wavevm_ram）
     export WVM_SHM_FILE="/wavevm_ram_node0"
     # 3. 加载内核模块
-    sudo insmod wavevm.ko 
-    service_port=9000 
-    local_slave_port=9005
+    sudo insmod wavevm.ko service_port=9000 local_slave_port=9005
     # 4. 启动 Master
     # <RAM_MB> <L_PORT> <CONF> <ID> <C_PORT> <SLAVE_PORT> <SYNC_BATCH>
     ./wavevm_node_master 4096 9002 /etc/wavevm/logical_topology.txt 0 9001 9005 64 &
@@ -930,7 +930,8 @@ V30.0 严禁将所有代码混为一谈。逻辑上的“Node”在物理上必�
     ├── common_include/                     # [基础设施]
     │   ├── wavevm_config.h
     │   ├── wavevm_protocol.h              # Wavelet 协议栈, CRC32
-    │   └── crc32.h                         # CRC32 查表法实现
+    │   ├── crc32.h                         # CRC32 查表法实现
+    │   └── uthash.h                        # 哈希表库
     │
     ├── master_core/                        # [Swarm Daemon]
     │   ├── logic_core.c                    # DHT, Pub/Sub, Versioning FSM
@@ -945,7 +946,6 @@ V30.0 严禁将所有代码混为一谈。逻辑上的“Node”在物理上必�
     ├── gateway_service/                    # [网络侧车]
     │   ├── aggregator.c                    # Uthash, Backpressure
     │   ├── main.c                         # (Unified entry)
-    │   └── uthash.h                        # 哈希表库
     │
     ├── qemu_patch/                         # [前端适配]
     │   ├── accel/wavevm/wavevm-user-mem.c # Latch, Diff Harvester, Version Validator
@@ -1075,33 +1075,9 @@ V30.0 默认物理世界是充满敌意的，因此设计了层层递进的恢�
 
 构建了一个即使在物理环境极度恶劣、规模达到行星级的场景下，依然能保持 90% 以上算力转化率的SSI底座。**这就是人类在软件定义物理法则领域能达到的最高成就。**
 
-@@@@@
-
 ## Repo Files
 
-**文件**: `.gitignore`
-
-```gitignore
-ctl_tool/wvm_ctl
-gateway_service/wavevm_gateway
-master_core/wavevm_node_master
-slave_daemon/wavevm_node_slave
-
-```
-
-**文件**: `README.md`
-
-```markdown
-# WaveVM_Frontier-X
-```
-
-**文件**: `common_include/uthash.h`
-
-```c
-/* uthash.h (3rd-party single-header library) */
-```
-
-## Step 0: 环境预检 (sysctl_check.sh)
+### Step 0: 环境预检 (sysctl_check.sh)
 
 **文件**: `deploy/sysctl_check.sh`
 
@@ -1138,9 +1114,10 @@ sysctl -w net.core.netdev_max_backlog=10000 > /dev/null
 echo "[+] Network device backlog queue increased."
 echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 ```
+
 ---
 
-## Step 1: 基础设施定义 (Infrastructure)
+### Step 1: 基础设施定义 (Infrastructure)
 
 **文件**: `common_include/wavevm_config.h`
 
@@ -1240,6 +1217,7 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 
 #endif // WAVEVM_CONFIG_H
 ```
+
 **文件**: `common_include/platform_defs.h`
 
 ```c
@@ -1268,6 +1246,7 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 
 #endif // PLATFORM_DEFS_H
 ```
+
 **文件**: `common_include/wavevm_protocol.h`
 
 ```c
@@ -1566,6 +1545,7 @@ extern int g_ctrl_port;
 
 #endif // WAVEVM_PROTOCOL_H
 ```
+
 **文件**: `common_include/wavevm_ioctl.h`
 
 ```c
@@ -1619,6 +1599,7 @@ struct wvm_ioctl_mem_layout {
 
 #endif // WAVEVM_IOCTL_H
 ```
+
 **文件**: `common_include/crc32.h`
 
 ```c
@@ -1688,9 +1669,10 @@ static inline uint32_t calculate_crc32(const void* data, size_t length) {
 #endif // CRC32_H
 #endif // __SSE4_2__
 ```
+
 ---
 
-## Step 2: 统一驱动接口 (Unified Driver)
+### Step 2: 统一驱动接口 (Unified Driver)
 
 **文件**: `master_core/unified_driver.h`
 
@@ -1732,9 +1714,10 @@ struct dsm_driver_ops {
 extern struct dsm_driver_ops *g_ops;
 #endif
 ```
+
 ---
 
-## Step 3: 纯逻辑核心 (Logic Core)
+### Step 3: 纯逻辑核心 (Logic Core)
 
 **文件**: `master_core/logic_core.h`
 
@@ -3540,9 +3523,10 @@ void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg
     pthread_rwlock_unlock(&g_view_lock);
 }
 ```
+
 ---
 
-## Step 4: 内核后端实现与内核构建脚本 (Kernel Backend & Kernel Build Script)
+### Step 4: 内核后端实现与内核构建脚本 (Kernel Backend & Kernel Build Script)
 
 **文件**: `master_core/kernel_backend.c`
 
@@ -5032,6 +5016,7 @@ module_init(wavevm_init);
 module_exit(wavevm_exit);
 MODULE_LICENSE("GPL");
 ```
+
 **文件**: `master_core/Kbuild`
 
 ```makefile
@@ -5046,9 +5031,10 @@ wavevm-y := kernel_backend.o logic_core.o
 # $(src) 是内核构建系统提供的变量，指向当前目录
 ccflags-y := -I$(src)/../common_include -std=gnu11
 ```
+
 ---
 
-## Step 5: 用户态后端实现 (User Backend)
+### Step 5: 用户态后端实现 (User Backend)
 
 **文件**: `master_core/user_backend.c`
 
@@ -6038,6 +6024,7 @@ int user_backend_init(int my_node_id, int port) {
     return 0;
 }
 ```
+
 **文件**: `master_core/main_wrapper.c`
 
 ```c
@@ -6659,6 +6646,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
+
 **文件**: `master_core/Makefile_User`
 
 ```makefile
@@ -6675,9 +6663,16 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
+
 ---
 
-## Step 6: Slave 守护进程 (Slave Daemon)
+### Step 6: Slave 守护进程 (Slave Daemon)
+
+**文件**: `common_include/uthash.h`
+
+```c
+/* uthash.h (3rd-party single-header library) */
+```
 
 **文件**: `slave_daemon/slave_hybrid.c`
 
@@ -7744,6 +7739,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
+
 **文件**: `slave_daemon/slave_vfio.h`
 
 ```c
@@ -7796,6 +7792,7 @@ void wvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr);
 
 #endif
 ```
+
 **文件**: `slave_daemon/slave_vfio.c`
 
 ```c
@@ -8194,6 +8191,7 @@ void wvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
     close(epfd);
 }
 ```
+
 **文件**: `slave_daemon/Makefile`
 
 ```makefile
@@ -8210,9 +8208,10 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
+
 ---
 
-## Step 7: 控制面工具 (Control Tool)
+### Step 7: 控制面工具 (Control Tool)
 
 **文件**: `ctl_tool/Makefile`
 
@@ -8229,6 +8228,7 @@ $(TARGET): main.c
 clean:
 	rm -f $(TARGET)
 ```
+
 **文件**: `ctl_tool/main.c`
 
 ```c
@@ -8457,9 +8457,10 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
+
 ---
 
-## Step 8: QEMU 5.2.0 适配 (Frontend)
+### Step 8: QEMU 5.2.0 适配 (Frontend)
 
 此部分将 WaveVM 注册为 QEMU 加速器，并接管 CPU 调度循环。
 
@@ -8540,6 +8541,7 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->idt.limit = ctx->idt_limit;
 }
 ```
+
 **文件**: `qemu_patch/accel/wavevm/wavevm-all.c`
 
 ```c
@@ -9429,6 +9431,7 @@ int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write) {
     return ret; 
 }
 ```
+
 **文件**: `qemu_patch/accel/wavevm/wavevm-cpu.c`
 
 ```c
@@ -9848,6 +9851,7 @@ void wavevm_start_vcpu_thread(CPUState *cpu) {
     qemu_thread_create(cpu->thread, thread_name, wavevm_cpu_thread_fn, cpu, QEMU_THREAD_JOINABLE);
 }
 ```
+
 **文件**: `qemu_patch/accel/wavevm/wavevm-user-mem.c`
 
 ```c
@@ -11081,6 +11085,7 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
     mprotect(g_ram_base, g_ram_size, PROT_NONE);
 }
 ```
+
 **文件**: `qemu_patch/hw/wavevm/wavevm_mem.c`
 
 ```c
@@ -11122,6 +11127,7 @@ void wavevm_setup_memory_region(MemoryRegion *mr, uint64_t size, int fd) {
     fprintf(stderr, "WaveVM: Mapped %lu bytes (Dirty Logging ON).\n", size);
 }
 ```
+
 **文件**: `qemu_patch/hw/wavevm/wavevm-gpu-stub.c`
 
 ```c
@@ -11376,6 +11382,7 @@ static void wvm_gpu_stub_register_types(void) {
 }
 type_init(wvm_gpu_stub_register_types)
 ```
+
 **文件**: `qemu_patch/hw/wavevm/wavevm-block-hook.c`
 
 ```c
@@ -11416,6 +11423,7 @@ static int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_wr
     return ret; // 0=Intercepted & Success, -1=Passthrough
 }
 ```
+
 **文件**: `qemu_patch/virtio-blk.diff`
 
 ```diff
@@ -11446,9 +11454,10 @@ static int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_wr
          virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
          return 0;
 ```
+
 ---
 
-## Step 9: 优化的网关 (Gateway)
+### Step 9: 优化的网关 (Gateway)
 
 此模块运行在用户态，是连接 QEMU 和物理网络的枢纽。为了支持 1000,000 节点，必须使用 **按需分配（Lazy Allocation）** 策略，严禁一次性分配所有节点的缓冲区（那会瞬间消耗数百 MB 内存）。
 
@@ -11488,7 +11497,8 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
-**文件**: `gateway_service/aggregator.h` (接口定义)
+
+**文件**: `gateway_service/aggregator.h`
 
 ```c
 #ifndef AGGREGATOR_H
@@ -11539,6 +11549,7 @@ void flush_all_buffers(void);
 
 #endif // AGGREGATOR_H
 ```
+
 **文件**: `gateway_service/aggregator.c`
 
 ```c
@@ -11573,7 +11584,7 @@ void flush_all_buffers(void);
 
 #include "aggregator.h"
 #include "../common_include/wavevm_protocol.h"
-#include "uthash.h"
+#include "../slave_daemon/uthash.h"
 
 #if defined(__x86_64__) || defined(__i386__)
   #define CPU_RELAX() __asm__ volatile("pause" ::: "memory")
@@ -12091,6 +12102,7 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
 
     return 0;}
 ```
+
 **文件**: `gateway_service/Makefile`
 
 ```c
@@ -12108,9 +12120,10 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET)
 ```
+
 ---
 
-### ✅ 全局完成确认 (Global Completion Confirmation)
+## ✅ 全局完成确认 (Global Completion Confirmation)
 
 至此，**WaveVM "Frontier-X" V30.0** 的所有核心组件与周边生态（Step 0 到 Step 9）均已定义完毕。
 
