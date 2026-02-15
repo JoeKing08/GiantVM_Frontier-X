@@ -1,10 +1,10 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "giantvm_protocol.h"
+#include "../../../common_include/wavevm_protocol.h"
 
 // Export QEMU TCG state to network packet
-void gvm_tcg_get_state(CPUState *cpu, gvm_tcg_context_t *ctx) {
+void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
 
@@ -40,7 +40,7 @@ void gvm_tcg_get_state(CPUState *cpu, gvm_tcg_context_t *ctx) {
 }
 
 // Import state from network packet to QEMU TCG
-void gvm_tcg_set_state(CPUState *cpu, gvm_tcg_context_t *ctx) {
+void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
 

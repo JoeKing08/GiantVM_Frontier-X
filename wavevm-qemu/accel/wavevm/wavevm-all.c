@@ -20,45 +20,22 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
-#include "giantvm_protocol.h"
+#include "../../../common_include/wavevm_protocol.h"
+#include "wavevm-accel.h"
 
 extern int kvm_init(MachineState *ms);
 extern int tcg_init(MachineState *ms);
 
-#include "giantvm_protocol.h"
-
 // 引用相关模块
-extern void giantvm_user_mem_init(void *ram_ptr, size_t ram_size);
-extern void giantvm_setup_memory_region(MemoryRegion *mr, uint64_t size, int fd);
-extern void gvm_tcg_get_state(CPUState *cpu, gvm_tcg_context_t *ctx);
-extern void gvm_tcg_set_state(CPUState *cpu, gvm_tcg_context_t *ctx);
-extern void gvm_set_ttl_interval(int ms);
-extern void gvm_register_volatile_ram(uint64_t gpa, uint64_t size);
-extern void gvm_apply_remote_push(uint16_t msg_type, void *payload);
+extern void wavevm_user_mem_init(void *ram_ptr, size_t ram_size);
+extern void wavevm_setup_memory_region(MemoryRegion *mr, uint64_t size, int fd);
+extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
+extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
+extern void wvm_set_ttl_interval(int ms);
+extern void wvm_register_volatile_ram(uint64_t gpa, uint64_t size);
+extern void wvm_apply_remote_push(uint16_t msg_type, void *payload);
 
-#define TYPE_GIANTVM_ACCEL "giantvm-accel"
-#define GIANTVM_ACCEL(obj) OBJECT_CHECK(GiantVMAccelState, (obj), TYPE_GIANTVM_ACCEL)
-
-int g_gvm_local_split = 4;
-
-typedef enum {
-    GVM_MODE_KERNEL,
-    GVM_MODE_USER,
-} GiantVMMode;
-
-typedef struct GiantVMAccelState {
-    AccelState parent_obj;
-    int dev_fd;
-    int sync_sock;
-    int ipc_sock;
-    GiantVMMode mode;
-    QemuThread sync_thread; 
-    QemuThread ipc_thread;
-    QemuThread irq_thread;
-    bool sync_thread_running;
-    QemuThread net_thread;
-    int master_sock;
-} GiantVMAccelState;
+int g_wvm_local_split = 4;
 
 /* [V28 FIX] 坚如磐石的读取函数，处理 Partial Read 和 EINTR */
 static int read_exact(int fd, void *buf, size_t len) {
@@ -81,9 +58,9 @@ static int read_exact(int fd, void *buf, size_t len) {
 }
 
 // 显式定义查找表，确保链接时不丢失符号
-static const char *const GiantVMMode_lookup[] = {
-    [GVM_MODE_KERNEL] = "kernel",
-    [GVM_MODE_USER] = "user",
+static const char *const WaveVMMode_lookup[] = {
+    [WVM_MODE_KERNEL] = "kernel",
+    [WVM_MODE_USER] = "user",
     NULL
 };
 
@@ -95,11 +72,11 @@ int connect_to_master_helper(void) {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     
     // [V28 Fix] Dynamic Path
-    const char *env_path = getenv("GVM_ENV_SOCK_PATH");
+    const char *env_path = getenv("WVM_ENV_SOCK_PATH");
     if (!env_path) {
-        char *inst_id = getenv("GVM_INSTANCE_ID");
+        char *inst_id = getenv("WVM_INSTANCE_ID");
         static char fallback[128]; // static to be safe scope-wise though redundant here
-        snprintf(fallback, sizeof(fallback), "/tmp/gvm_user_%s.sock", inst_id ? inst_id : "0");
+        snprintf(fallback, sizeof(fallback), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
         env_path = fallback;
     }
 
@@ -113,16 +90,16 @@ int connect_to_master_helper(void) {
 }
 
 // Master Mode B (User) 的 IPC 监听线程
-static void *giantvm_master_ipc_thread(void *arg) {
-    GiantVMAccelState *s = (GiantVMAccelState *)arg;
+static void *wavevm_master_ipc_thread(void *arg) {
+    WaveVMAccelState *s = (WaveVMAccelState *)arg;
     
     s->ipc_sock = connect_to_master_helper();
     if (s->ipc_sock < 0) {
-        fprintf(stderr, "[GVM] Failed to connect IPC socket for IRQ listening.\n");
+        fprintf(stderr, "[WVM] Failed to connect IPC socket for IRQ listening.\n");
         return NULL;
     }
 
-    struct gvm_ipc_header_t hdr;
+    struct wvm_ipc_header_t hdr;
     // 缓冲区用于接收 payload (最大可能的消息体)
     uint8_t payload_buf[4096]; 
 
@@ -140,7 +117,7 @@ static void *giantvm_master_ipc_thread(void *arg) {
         // [V28 FIX] 完整读取 Payload，防止粘包错位
         if (hdr.len > 0) {
             if (hdr.len > sizeof(payload_buf)) {
-                fprintf(stderr, "[GVM] IPC Payload too large: %d\n", hdr.len);
+                fprintf(stderr, "[WVM] IPC Payload too large: %d\n", hdr.len);
                 // 严重协议错误，无法恢复同步，必须断开
                 close(s->ipc_sock);
                 return NULL;
@@ -151,7 +128,7 @@ static void *giantvm_master_ipc_thread(void *arg) {
         }
 
         // 1. 处理中断消息
-        if (hdr.type == GVM_IPC_TYPE_IRQ) {
+        if (hdr.type == WVM_IPC_TYPE_IRQ) {
             qemu_mutex_lock_iothread();
             if (kvm_enabled()) {
                  struct kvm_irq_level irq;
@@ -164,8 +141,8 @@ static void *giantvm_master_ipc_thread(void *arg) {
             qemu_mutex_unlock_iothread();
         }
         // 2. 处理内存失效 (MESI Invalidate)
-        else if (hdr.type == GVM_IPC_TYPE_MEM_WRITE) {
-            struct gvm_ipc_write_req *req = (struct gvm_ipc_write_req *)payload_buf;
+        else if (hdr.type == WVM_IPC_TYPE_MEM_WRITE) {
+            struct wvm_ipc_write_req *req = (struct wvm_ipc_write_req *)payload_buf;
             // 约定：len=0 表示 Invalidate
             if (req->len == 0) {
                 hwaddr len = 4096;
@@ -176,10 +153,10 @@ static void *giantvm_master_ipc_thread(void *arg) {
                 }
             }
         }
-        else if (hdr.type == GVM_IPC_TYPE_INVALIDATE) { // Type 6
-            // 解包内部的 gvm_header
-            struct gvm_header *net_hdr = (struct gvm_header *)payload_buf;
-            void *net_payload = payload_buf + sizeof(struct gvm_header);
+        else if (hdr.type == WVM_IPC_TYPE_INVALIDATE) { // Type 6
+            // 解包内部的 wvm_header
+            struct wvm_header *net_hdr = (struct wvm_header *)payload_buf;
+            void *net_payload = payload_buf + sizeof(struct wvm_header);
             uint16_t msg_type = ntohs(net_hdr->msg_type);
             // 处理 Prophet 同步指令
             if (msg_type == MSG_RPC_BATCH_MEMSET) {
@@ -192,14 +169,14 @@ static void *giantvm_master_ipc_thread(void *arg) {
                 tb_flush(first_cpu); 
                 
                 // 2. 同时也需要更新 User-Mode 的版本号 (调用 user-mem.c)
-                gvm_apply_remote_push(msg_type, net_payload);
+                wvm_apply_remote_push(msg_type, net_payload);
                 
                 qemu_mutex_unlock_iothread();
                 continue;
             }
             
             // 调用 user-mem 提供的逻辑应用更新
-            gvm_apply_remote_push(msg_type, net_payload);
+            wvm_apply_remote_push(msg_type, net_payload);
         }
     }
     close(s->ipc_sock);
@@ -207,8 +184,8 @@ static void *giantvm_master_ipc_thread(void *arg) {
 }
 
 // Master 模式专用脏页同步线程 (仅 KVM 需此线程，TCG 由 user-mem 处理)
-static void *giantvm_dirty_sync_thread(void *arg) {
-    GiantVMAccelState *s = (GiantVMAccelState *)arg;
+static void *wavevm_dirty_sync_thread(void *arg) {
+    WaveVMAccelState *s = (WaveVMAccelState *)arg;
     struct kvm_dirty_log dlog;
     KVMState *k = NULL;
 
@@ -256,8 +233,8 @@ static void *giantvm_dirty_sync_thread(void *arg) {
                         uint64_t gpa = (uint64_t)slot->base_gfn * 4096 + page_idx * 4096;
                         if (gpa >= ((uint64_t)slot->base_gfn * 4096 + slot->ram_size)) continue;
 
-                        struct gvm_ipc_header_t hdr = { .type = GVM_IPC_TYPE_MEM_WRITE, .len = sizeof(struct gvm_ipc_write_req) };
-                        struct gvm_ipc_write_req req = { .gpa = gpa, .len = 4096 };
+                        struct wvm_ipc_header_t hdr = { .type = WVM_IPC_TYPE_MEM_WRITE, .len = sizeof(struct wvm_ipc_write_req) };
+                        struct wvm_ipc_write_req req = { .gpa = gpa, .len = 4096 };
 
                         if (write(s->sync_sock, &hdr, sizeof(hdr)) == sizeof(hdr)) {
                             write(s->sync_sock, &req, sizeof(req));
@@ -285,8 +262,8 @@ static void *giantvm_dirty_sync_thread(void *arg) {
 }
 
 // Kernel Mode IRQ 监听线程
-static void *giantvm_kernel_irq_thread(void *arg) {
-    GiantVMAccelState *s = (GiantVMAccelState *)arg;
+static void *wavevm_kernel_irq_thread(void *arg) {
+    WaveVMAccelState *s = (WaveVMAccelState *)arg;
     uint32_t irq_num;
     
     while (1) {
@@ -312,8 +289,8 @@ static void *giantvm_kernel_irq_thread(void *arg) {
 }
 
 // Slave 网络处理线程 (支持 KVM 和 TCG 双模)
-static void *giantvm_slave_net_thread(void *arg) {
-    GiantVMAccelState *s = (GiantVMAccelState *)arg;
+static void *wavevm_slave_net_thread(void *arg) {
+    WaveVMAccelState *s = (WaveVMAccelState *)arg;
     CPUState *cpu = first_cpu; 
     #define BATCH_SIZE 64
     #define MAX_PKT_SIZE 4096 
@@ -333,7 +310,7 @@ static void *giantvm_slave_net_thread(void *arg) {
         msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
     }
 
-    printf("[GiantVM-Slave] Network Loop Active (Engine: %s, FD: %d).\n", 
+    printf("[WaveVM-Slave] Network Loop Active (Engine: %s, FD: %d).\n", 
            kvm_enabled() ? "KVM" : "TCG", s->master_sock);
 
     while (1) {
@@ -348,9 +325,9 @@ static void *giantvm_slave_net_thread(void *arg) {
             uint8_t *buf = (uint8_t *)iovecs[i].iov_base;
             int len = msgs[i].msg_len;
             
-            if (len >= sizeof(struct gvm_header)) {
-                struct gvm_header *hdr = (struct gvm_header *)buf;
-                void *payload = buf + sizeof(struct gvm_header);
+            if (len >= sizeof(struct wvm_header)) {
+                struct wvm_header *hdr = (struct wvm_header *)buf;
+                void *payload = buf + sizeof(struct wvm_header);
 
                 // 1. 内存写 (Master -> Slave)
                 if (hdr->msg_type == MSG_MEM_WRITE) {
@@ -364,34 +341,34 @@ static void *giantvm_slave_net_thread(void *arg) {
                     qemu_mutex_unlock_iothread();
                     hdr->msg_type = MSG_MEM_ACK;
                     hdr->payload_len = 0;
-                    sendto(s->master_sock, buf, sizeof(struct gvm_header), 0, 
+                    sendto(s->master_sock, buf, sizeof(struct wvm_header), 0, 
                           (struct sockaddr *)&addrs[i], sizeof(struct sockaddr_in));
                 }
                 // 2. 内存读 (Master -> Slave)
                 else if (hdr->msg_type == MSG_MEM_READ) {
                     uint64_t gpa = *(uint64_t *)payload;
                     uint32_t read_len = 4096; 
-                    if (sizeof(struct gvm_header) + read_len <= MAX_PKT_SIZE) {
+                    if (sizeof(struct wvm_header) + read_len <= MAX_PKT_SIZE) {
                         cpu_physical_memory_read(gpa, payload, read_len);
                         hdr->msg_type = MSG_MEM_ACK;
                         hdr->payload_len = read_len;
-                        sendto(s->master_sock, buf, sizeof(struct gvm_header) + read_len, 0, 
+                        sendto(s->master_sock, buf, sizeof(struct wvm_header) + read_len, 0, 
                               (struct sockaddr *)&addrs[i], sizeof(struct sockaddr_in));
                     }
                 }
                 // 3. 远程执行 (Master -> Slave)
                 else if (hdr->msg_type == MSG_VCPU_RUN) {
-                    struct gvm_ipc_cpu_run_req *req = (struct gvm_ipc_cpu_run_req *)payload;
+                    struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)payload;
                     qemu_mutex_lock_iothread(); // TCG 必须持有 BQL
                     
                     // A. 恢复上下文
                     if (hdr->mode_tcg) {
                         // TCG 模式：直接写入 env
-                        gvm_tcg_set_state(cpu, &req->ctx.tcg);
+                        wvm_tcg_set_state(cpu, &req->ctx.tcg);
                     } else if (kvm_enabled()) {
                         // KVM 模式：ioctl 设置
                         struct kvm_regs kregs; struct kvm_sregs ksregs;
-                        gvm_kvm_context_t *kctx = &req->ctx.kvm;
+                        wvm_kvm_context_t *kctx = &req->ctx.kvm;
                         kregs.rax = kctx->rax; kregs.rbx = kctx->rbx; kregs.rcx = kctx->rcx;
                         kregs.rdx = kctx->rdx; kregs.rsi = kctx->rsi; kregs.rdi = kctx->rdi;
                         kregs.rsp = kctx->rsp; kregs.rbp = kctx->rbp;
@@ -425,14 +402,14 @@ static void *giantvm_slave_net_thread(void *arg) {
                     }
 
                     // C. 导出上下文并回包
-                    struct gvm_ipc_cpu_run_ack *ack = (struct gvm_ipc_cpu_run_ack *)payload;
+                    struct wvm_ipc_cpu_run_ack *ack = (struct wvm_ipc_cpu_run_ack *)payload;
                     if (hdr->mode_tcg) {
                         ack->mode_tcg = 1;
-                        gvm_tcg_get_state(cpu, &ack->ctx.tcg);
+                        wvm_tcg_get_state(cpu, &ack->ctx.tcg);
                     } else if (kvm_enabled()) {
                         ack->mode_tcg = 0;
                         struct kvm_regs kregs; struct kvm_sregs ksregs;
-                        gvm_kvm_context_t *kctx = &ack->ctx.kvm;
+                        wvm_kvm_context_t *kctx = &ack->ctx.kvm;
                         kvm_vcpu_ioctl(cpu, KVM_GET_REGS, &kregs);
                         kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &ksregs);
                         kctx->rax = kregs.rax; kctx->rbx = kregs.rbx; kctx->rcx = kregs.rcx;
@@ -467,7 +444,7 @@ static void *giantvm_slave_net_thread(void *arg) {
                           (struct sockaddr *)&addrs[i], sizeof(struct sockaddr_in));
                 } else if (hdr->msg_type == MSG_PING) {
                     // [FIX] 透传 PING 给 Gateway/Master，由真正的 Owner 回复 ACK
-                    sendto(s->master_sock, buf, sizeof(struct gvm_header), 0, 
+                    sendto(s->master_sock, buf, sizeof(struct wvm_header), 0, 
                           (struct sockaddr *)&addrs[i], sizeof(struct sockaddr_in));
                 }
             }
@@ -478,19 +455,19 @@ static void *giantvm_slave_net_thread(void *arg) {
     return NULL;
 }
 
-static int giantvm_init_machine_kernel(GiantVMAccelState *s, MachineState *ms) {
-    fprintf(stderr, "[GiantVM-QEMU] KERNEL MODE: Connecting to /dev/giantvm...\n");
-    s->dev_fd = open("/dev/giantvm", O_RDWR);
+static int wavevm_init_machine_kernel(WaveVMAccelState *s, MachineState *ms) {
+    fprintf(stderr, "[WaveVM-QEMU] KERNEL MODE: Connecting to /dev/wavevm...\n");
+    s->dev_fd = open("/dev/wavevm", O_RDWR);
     if (s->dev_fd < 0) return -errno;
-    giantvm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
+    wavevm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
     // 启动线程
-    qemu_thread_create(&s->irq_thread, "gvm-k-irq", giantvm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
+    qemu_thread_create(&s->irq_thread, "wvm-k-irq", wavevm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
     return 0;
 }
 
-static int giantvm_init_machine_user(GiantVMAccelState *s, MachineState *ms) {
+static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
     // Slave Mode Check (FD Inheritance)
-    char *env_cmd = getenv("GVM_SOCK_CMD");
+    char *env_cmd = getenv("WVM_SOCK_CMD");
     
     if (env_cmd) {
         // [Slave Mode]
@@ -498,12 +475,12 @@ static int giantvm_init_machine_user(GiantVMAccelState *s, MachineState *ms) {
     } else {
         // [Master Mode]
         // 读取环境变量以支持单机多实例
-        const char *shm_path = getenv("GVM_SHM_FILE");
-        if (!shm_path) shm_path = "/giantvm_ram"; // Default fallback (Keep sync with config.h)
+        const char *shm_path = getenv("WVM_SHM_FILE");
+        if (!shm_path) shm_path = "/wavevm_ram"; // Default fallback (Keep sync with config.h)
 
         int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0666);
         if (shm_fd < 0) {
-            fprintf(stderr, "GiantVM: Failed to open SHM file '%s': %s\n", shm_path, strerror(errno));
+            fprintf(stderr, "WaveVM: Failed to open SHM file '%s': %s\n", shm_path, strerror(errno));
             exit(1);
         }
         
@@ -514,28 +491,28 @@ static int giantvm_init_machine_user(GiantVMAccelState *s, MachineState *ms) {
             exit(1);
         }
 
-        giantvm_setup_memory_region(ms->ram, ms->ram_size, shm_fd);
+        wavevm_setup_memory_region(ms->ram, ms->ram_size, shm_fd);
         close(shm_fd);
         
         // Start KVM Sync Thread (Only needed for KVM Master)
         if (kvm_enabled()) {
             s->sync_thread_running = true;
-            qemu_thread_create(&s->sync_thread, "gvm-sync", giantvm_dirty_sync_thread, s, QEMU_THREAD_DETACHED);
+            qemu_thread_create(&s->sync_thread, "wvm-sync", wavevm_dirty_sync_thread, s, QEMU_THREAD_DETACHED);
             // 启动 IPC 监听线程 (处理 VFIO 中断)
-            qemu_thread_create(&s->ipc_thread, "gvm-ipc-rx", giantvm_master_ipc_thread, s, QEMU_THREAD_DETACHED);
+            qemu_thread_create(&s->ipc_thread, "wvm-ipc-rx", wavevm_master_ipc_thread, s, QEMU_THREAD_DETACHED);
         }
     }
         
     // 初始化拦截信号
     void *ram_ptr = memory_region_get_ram_ptr(ms->ram);
-    giantvm_user_mem_init(ram_ptr, ms->ram_size);
+    wavevm_user_mem_init(ram_ptr, ms->ram_size);
 
     return 0;
 }
 
-static struct gvm_ioctl_mem_layout global_layout;
+static struct wvm_ioctl_mem_layout global_layout;
 
-static void giantvm_region_add(MemoryListener *listener, MemoryRegionSection *section) {
+static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *section) {
     if (!memory_region_is_ram(section->mr)) return;
 
     uint64_t start_gpa = section->offset_within_address_space;
@@ -551,91 +528,91 @@ static void giantvm_region_add(MemoryListener *listener, MemoryRegionSection *se
         
         // 同时通知 User-Mem 映射表
         void *hva = memory_region_get_ram_ptr(section->mr) + section->offset_within_region;
-        extern void giantvm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
-        giantvm_register_ram_block(hva, size, start_gpa);
+        extern void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
+        wavevm_register_ram_block(hva, size, start_gpa);
     }
 }
 
 // 关键：在虚拟机启动完成前，将拓扑同步给内核
-static void giantvm_sync_topology(int dev_fd) {
+static void wavevm_sync_topology(int dev_fd) {
     if (ioctl(dev_fd, IOCTL_SET_MEM_LAYOUT, &global_layout) < 0) {
-        perror("[GVM] Failed to sync memory layout to kernel");
+        perror("[WVM] Failed to sync memory layout to kernel");
         exit(1);
     }
 }
 
 // 监听器结构体
-static MemoryListener giantvm_mem_listener = {
-    .region_add = giantvm_region_add,
+static MemoryListener wavevm_mem_listener = {
+    .region_add = wavevm_region_add,
 };
 
-static int giantvm_init_machine(MachineState *ms) {
-    GiantVMAccelState *s = GIANTVM_ACCEL(ms->accelerator);
+static int wavevm_init_machine(MachineState *ms) {
+    WaveVMAccelState *s = WAVEVM_ACCEL(ms->accelerator);
     bool has_kvm = (access("/dev/kvm", R_OK | W_OK) == 0);
-    char *role = getenv("GVM_ROLE");
+    char *role = getenv("WVM_ROLE");
     bool is_slave = (role && strcmp(role, "SLAVE") == 0);
 
-    if (is_slave) s->mode = GVM_MODE_USER;
+    if (is_slave) s->mode = WVM_MODE_USER;
 
     int ret;
     if (has_kvm) ret = kvm_init(ms);
     else {
-        if (!is_slave && s->mode == GVM_MODE_KERNEL) return -1; 
+        if (!is_slave && s->mode == WVM_MODE_KERNEL) return -1; 
         ret = tcg_init(ms);
     }
     if (ret < 0) return ret;
 
-    memory_listener_register(&giantvm_mem_listener, &address_space_memory);
+    memory_listener_register(&wavevm_mem_listener, &address_space_memory);
 
-    if (s->mode == GVM_MODE_KERNEL) {
-        s->dev_fd = open("/dev/giantvm", O_RDWR);
+    if (s->mode == WVM_MODE_KERNEL) {
+        s->dev_fd = open("/dev/wavevm", O_RDWR);
         if (s->dev_fd < 0) return -errno;
         
-        giantvm_sync_topology(s->dev_fd); 
+        wavevm_sync_topology(s->dev_fd); 
         
-        giantvm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
-        qemu_thread_create(&s->irq_thread, "gvm-k-irq", giantvm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
+        wavevm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
+        qemu_thread_create(&s->irq_thread, "wvm-k-irq", wavevm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
     } 
 
-    if (s->mode == GVM_MODE_KERNEL) ret = giantvm_init_machine_kernel(s, ms);
-    else ret = giantvm_init_machine_user(s, ms);
+    if (s->mode == WVM_MODE_KERNEL) ret = wavevm_init_machine_kernel(s, ms);
+    else ret = wavevm_init_machine_user(s, ms);
     if (ret < 0) return ret;
 
     // 只要是 Slave (无论 KVM 还是 TCG)，都启动网络处理线程
     // 这样 TCG Slave 也能接收 CPU 任务和内存请求
     if (is_slave) {
         // Now safe to run net thread in TCG mode because it uses a separate socket
-        printf("[GiantVM] Starting Slave Net Thread on FD %d...\n", s->master_sock);
-        qemu_thread_create(&s->net_thread, "gvm-slave-net", giantvm_slave_net_thread, s, QEMU_THREAD_DETACHED);
+        printf("[WaveVM] Starting Slave Net Thread on FD %d...\n", s->master_sock);
+        qemu_thread_create(&s->net_thread, "wvm-slave-net", wavevm_slave_net_thread, s, QEMU_THREAD_DETACHED);
         // 暂停主 vCPU 线程，控制权移交给 net_thread 驱动
         if (current_cpu) { current_cpu->stop = true; current_cpu->halted = true; }
     }
 
-    if (s->mode == GVM_MODE_KERNEL) {
-        giantvm_sync_topology(s->dev_fd); 
+    if (s->mode == WVM_MODE_KERNEL) {
+        wavevm_sync_topology(s->dev_fd); 
     }
     return 0;
 }
 
-static void giantvm_set_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+static void wavevm_set_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     uint32_t value; if (!visit_type_uint32(v, name, &value, errp)) return;
-    g_gvm_local_split = value;
+    g_wvm_local_split = value;
 }
-static void giantvm_get_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
-    uint32_t value = g_gvm_local_split; visit_type_uint32(v, name, &value, errp);
+static void wavevm_get_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+    uint32_t value = g_wvm_local_split; visit_type_uint32(v, name, &value, errp);
 }
-static void giantvm_set_ttl(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+static void wavevm_set_ttl(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     uint32_t value;
     if (!visit_type_uint32(v, name, &value, errp)) return;
-    gvm_set_ttl_interval((int)value);
+    wvm_set_ttl_interval((int)value);
 }
-static void giantvm_get_ttl(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+static void wavevm_get_ttl(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     // Getter implementation usually needed for QOM but can be stubbed if write-only intent
     // keeping it simple
     uint32_t val = 0; 
     visit_type_uint32(v, name, &val, errp);
 }
-static void giantvm_set_watch(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+static void wavevm_set_watch(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     char *value;
     if (!visit_type_str(v, name, &value, errp)) return;
     
@@ -658,41 +635,41 @@ static void giantvm_set_watch(Object *obj, Visitor *v, const char *name, void *o
             else if (unit == 'G' || unit == 'g') size_bytes *= 1024 * 1024 * 1024;
             else if (unit == 'K' || unit == 'k') size_bytes *= 1024;
             
-            gvm_register_volatile_ram(gpa, size_bytes);
+            wvm_register_volatile_ram(gpa, size_bytes);
         }
         token = strtok_r(NULL, ";", &saveptr);
     }
     g_free(dup);
     g_free(value);
 }
-static void giantvm_get_watch(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
+static void wavevm_get_watch(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     char *val = g_strdup("");
     visit_type_str(v, name, &val, errp);
     g_free(val);
 }
-static void giantvm_accel_init(Object *obj) {
-    GiantVMAccelState *s = GIANTVM_ACCEL(obj); s->mode = GVM_MODE_KERNEL; 
-    object_property_add_enum(obj, "mode", "GiantVMMode", &GiantVMMode_lookup, (int64_t *)&s->mode, &error_abort);
-    object_property_add(obj, "split", "int", giantvm_get_split, giantvm_set_split, NULL, NULL, &error_abort);
+static void wavevm_accel_init(Object *obj) {
+    WaveVMAccelState *s = WAVEVM_ACCEL(obj); s->mode = WVM_MODE_KERNEL; 
+    object_property_add_enum(obj, "mode", "WaveVMMode", &WaveVMMode_lookup, (int64_t *)&s->mode, &error_abort);
+    object_property_add(obj, "split", "int", wavevm_get_split, wavevm_set_split, NULL, NULL, &error_abort);
     object_property_set_description(obj, "split", "Number of vCPUs to run locally (Tier 1)", &error_abort);
 }
-static void giantvm_accel_class_init(ObjectClass *oc, void *data) {
+static void wavevm_accel_class_init(ObjectClass *oc, void *data) {
     AccelClass *ac = ACCEL_CLASS(oc);
-    ac->name = "GiantVM-X"; ac->init_machine = giantvm_init_machine; ac->allowed = &error_abort;
+    ac->name = "WaveVM-X"; ac->init_machine = wavevm_init_machine; ac->allowed = &error_abort;
     #ifndef CONFIG_USER_ONLY
-    static CpusAccel giantvm_cpus = { .create_vcpu_thread = giantvm_start_vcpu_thread };
-    cpus_register_accel(&giantvm_cpus);
+    static CpusAccel wavevm_cpus = { .create_vcpu_thread = wavevm_start_vcpu_thread };
+    cpus_register_accel(&wavevm_cpus);
 
-    object_property_add(oc, "watch", "string", giantvm_get_watch, giantvm_set_watch, NULL, NULL, &error_abort);
+    object_property_add(oc, "watch", "string", wavevm_get_watch, wavevm_set_watch, NULL, NULL, &error_abort);
     object_property_set_description(oc, "watch", "List of volatile RAM ranges (e.g. 0xC0000:16M)", &error_abort);
     #endif
 }
-static const TypeInfo giantvm_accel_type = {
-    .name = TYPE_GIANTVM_ACCEL, .parent = TYPE_ACCEL, .instance_size = sizeof(GiantVMAccelState),
-    .class_init = giantvm_accel_class_init, .instance_init = giantvm_accel_init,
+static const TypeInfo wavevm_accel_type = {
+    .name = TYPE_WAVEVM_ACCEL, .parent = TYPE_ACCEL, .instance_size = sizeof(WaveVMAccelState),
+    .class_init = wavevm_accel_class_init, .instance_init = wavevm_accel_init,
 };
-static void giantvm_type_init(void) { type_register_static(&giantvm_accel_type); }
-type_init(giantvm_type_init);
+static void wavevm_type_init(void) { type_register_static(&wavevm_accel_type); }
+type_init(wavevm_type_init);
 
 // [Helper] 健壮写：处理 EINTR 和 EAGAIN
 static int write_all(int fd, const void *buf, size_t len) {
@@ -739,14 +716,14 @@ extern int connect_to_master_helper(void);
 
 // [V29 Prophet Core] 同步 RPC 发送
 // 返回 0 成功，-1 失败
-int gvm_send_rpc_sync(uint16_t msg_type, void *payload, size_t len) {
-    GiantVMAccelState *s = GIANTVM_ACCEL(current_machine->accelerator);
+int wvm_send_rpc_sync(uint16_t msg_type, void *payload, size_t len) {
+    WaveVMAccelState *s = WAVEVM_ACCEL(current_machine->accelerator);
     int fd = -1;
     int needs_close = 0;
 
     // 1. 获取连接 FD
-    if (s->mode == GVM_MODE_USER) {
-        char *role = getenv("GVM_ROLE");
+    if (s->mode == WVM_MODE_USER) {
+        char *role = getenv("WVM_ROLE");
         // Slave: 复用 CMD 通道
         if (role && strcmp(role, "SLAVE") == 0) {
             fd = s->master_sock; 
@@ -761,27 +738,27 @@ int gvm_send_rpc_sync(uint16_t msg_type, void *payload, size_t len) {
 
     if (fd < 0) return -1;
 
-    // 2. 构造数据包 (IPC头 + GVM头 + Payload)
-    size_t gvm_pkt_len = sizeof(struct gvm_header) + len;
-    size_t total_size = sizeof(struct gvm_ipc_header_t) + gvm_pkt_len;
+    // 2. 构造数据包 (IPC头 + WVM头 + Payload)
+    size_t wvm_pkt_len = sizeof(struct wvm_header) + len;
+    size_t total_size = sizeof(struct wvm_ipc_header_t) + wvm_pkt_len;
     
     uint8_t *buffer = g_malloc(total_size);
     if (!buffer) { if (needs_close) close(fd); return -1; }
 
-    struct gvm_ipc_header_t *ipc_hdr = (struct gvm_ipc_header_t *)buffer;
-    ipc_hdr->type = 99; // GVM_IPC_TYPE_RPC_PASSTHROUGH
-    ipc_hdr->len = gvm_pkt_len;
+    struct wvm_ipc_header_t *ipc_hdr = (struct wvm_ipc_header_t *)buffer;
+    ipc_hdr->type = 99; // WVM_IPC_TYPE_RPC_PASSTHROUGH
+    ipc_hdr->len = wvm_pkt_len;
 
-    struct gvm_header *hdr = (struct gvm_header *)(buffer + sizeof(struct gvm_ipc_header_t));
-    hdr->magic = htonl(GVM_MAGIC);
+    struct wvm_header *hdr = (struct wvm_header *)(buffer + sizeof(struct wvm_ipc_header_t));
+    hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
     hdr->slave_id = 0; 
-    hdr->req_id = GVM_HTONLL(SYNC_MAGIC); // "SYNC" Magic
+    hdr->req_id = WVM_HTONLL(SYNC_MAGIC); // "SYNC" Magic
     hdr->qos_level = 1; 
     hdr->crc32 = 0; 
 
-    if (len > 0) memcpy(buffer + sizeof(struct gvm_ipc_header_t) + sizeof(struct gvm_header), payload, len);
+    if (len > 0) memcpy(buffer + sizeof(struct wvm_ipc_header_t) + sizeof(struct wvm_header), payload, len);
 
     // 3. 发送指令
     if (write_all(fd, buffer, total_size) < 0) {
@@ -805,4 +782,3 @@ int gvm_send_rpc_sync(uint16_t msg_type, void *payload, size_t len) {
     if (needs_close) close(fd);
     return -1; // Fail/Timeout
 }
-

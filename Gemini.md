@@ -1092,28 +1092,7 @@ slave_daemon/wavevm_node_slave
 **文件**: `README.md`
 
 ```markdown
-# GiantVM_Frontier-X
-```
-
-**文件**: `common_include/giantvm_config.h`
-
-```c
-#pragma once
-#include "wavevm_config.h"
-```
-
-**文件**: `common_include/giantvm_ioctl.h`
-
-```c
-#pragma once
-#include "wavevm_ioctl.h"
-```
-
-**文件**: `common_include/giantvm_protocol.h`
-
-```c
-#pragma once
-#include "wavevm_protocol.h"
+# WaveVM_Frontier-X
 ```
 
 **文件**: `gateway_service/uthash.h`
@@ -14461,7 +14440,7 @@ clean:
 
 6.  **应用物理拦截补丁**
     ```bash
-    cd qemu-5.2.0
+    cd wavevm-qemu
     # 物理意义：在 virtio-blk 源码层注入 WaveVM 分布式拦截器
     patch -p1 < ../qemu_patch/virtio-blk.diff
     ```

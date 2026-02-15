@@ -1,1 +1,1 @@
-# GiantVM_Frontier-X
+# WaveVM_Frontier-X

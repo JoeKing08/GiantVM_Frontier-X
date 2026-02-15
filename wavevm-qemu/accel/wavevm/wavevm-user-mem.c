@@ -30,17 +30,17 @@
 #include <time.h>
 #include <stdatomic.h>
 
-#include "giantvm_protocol.h"
+#include "../../../common_include/wavevm_protocol.h"
 
 /* 
- * GiantVM V29.5 "Wavelet" User-Mode Memory Engine (Production Ready)
+ * WaveVM V29.5 "Wavelet" User-Mode Memory Engine (Production Ready)
  */
 
 // --- 全局配置与状态 ---
 static int g_is_slave = 0;
 static int g_fd_req = -1;  
 static __thread int t_req_sock = -1;
-static __thread uint8_t t_net_buf[GVM_MAX_PACKET_SIZE];
+static __thread uint8_t t_net_buf[WVM_MAX_PACKET_SIZE];
 // 引用外部计算函数 (确保已链接 crc32.o)
 extern uint32_t calculate_crc32(const void* data, size_t length);
 static int g_fd_push = -1; 
@@ -81,7 +81,7 @@ static int g_block_count = 0;
  * [关键逻辑] 将 RAM 块注册到私有映射表，并执行初始 mprotect(PROT_NONE) 以强制触发首次访问缺页。
  * [后果] 若未正确注册，特定的内存区域将脱离分布式一致性引擎的监控，导致该区域的写操作无法全网同步。
  */
-void giantvm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
+void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
     if (g_block_count >= MAX_RAM_BLOCKS) exit(1);
     mprotect(hva, size, PROT_NONE);
     g_mem_blocks[g_block_count].hva_start = (uintptr_t)hva;
@@ -93,7 +93,7 @@ void giantvm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
 
 // [替换] 查表法 HVA 转 GPA (用于 sigsegv)
 static uint64_t hva_to_gpa_safe(uintptr_t addr) {
-    // 这里 block_count 是在 giantvm_region_add 时动态增加的
+    // 这里 block_count 是在 wavevm_region_add 时动态增加的
     for (int i = 0; i < g_block_count; i++) {
         if (addr >= g_mem_blocks[i].hva_start && addr < g_mem_blocks[i].hva_end) {
             // 真实的 GPA = 块起始 GPA + 块内偏移
@@ -145,13 +145,13 @@ static void defer_ro_protect(uint64_t gpa) {
 // 发送 PUSH 包 (Diff 或 Zero)
 static void send_push_packet(uint64_t gpa, uint64_t version, void *data, uint16_t size, uint8_t flags) {
     if (g_fd_push < 0) return;
-    size_t pl_len = sizeof(struct gvm_diff_log) + size;
-    size_t pkt_len = sizeof(struct gvm_header) + pl_len;
+    size_t pl_len = sizeof(struct wvm_diff_log) + size;
+    size_t pkt_len = sizeof(struct wvm_header) + pl_len;
     uint8_t *buf = malloc(pkt_len);
     if (!buf) return;
 
-    struct gvm_header *hdr = (struct gvm_header *)buf;
-    hdr->magic = htonl(GVM_MAGIC);
+    struct wvm_header *hdr = (struct wvm_header *)buf;
+    hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_COMMIT_DIFF);
     hdr->payload_len = htons(pl_len);
     hdr->slave_id = htonl(g_slave_id);
@@ -160,9 +160,9 @@ static void send_push_packet(uint64_t gpa, uint64_t version, void *data, uint16_
     hdr->flags = flags; // [关键]
     hdr->crc32 = 0;
 
-    struct gvm_diff_log *log = (struct gvm_diff_log *)(buf + sizeof(*hdr));
-    log->gpa = GVM_HTONLL(gpa);
-    log->version = GVM_HTONLL(version);
+    struct wvm_diff_log *log = (struct wvm_diff_log *)(buf + sizeof(*hdr));
+    log->gpa = WVM_HTONLL(gpa);
+    log->version = WVM_HTONLL(version);
     log->offset = 0;
     log->size = htons(size);
 
@@ -187,7 +187,7 @@ _Static_assert(sizeof(aligned_latch_t) == 128, "Latch alignment failed");
 #define LATCH_SHARDS 256
 static aligned_latch_t g_latches[LATCH_SHARDS];
 
-// 初始化 (在 giantvm_user_mem_init 调用)
+// 初始化 (在 wavevm_user_mem_init 调用)
 static void init_latches(void) {
     for(int i=0; i<LATCH_SHARDS; i++) g_latches[i].val = (uint64_t)-1;
 }
@@ -243,12 +243,12 @@ static void buffer_future_packet(uint64_t gpa, uint64_t version, uint16_t type, 
  * [关键逻辑] 执行严格的版本判定（is_next_version）：顺序包直接 memcpy，版本断层包则强制失效（Invalidate）本地映射。
  * [后果] 实现了 MESI 协议的远程写入动作。它保证了即便在乱序网络下，本地 vCPU 看到的内存也是单调递增的一致性状态。
  */
-void gvm_apply_remote_push(uint16_t msg_type, void *payload) {
+void wvm_apply_remote_push(uint16_t msg_type, void *payload) {
 // --- 分支 1: Diff 推送 ---
     if (msg_type == MSG_PAGE_PUSH_DIFF) {
-        struct gvm_diff_log* log = (struct gvm_diff_log*)payload;
-        uint64_t gpa = GVM_NTOHLL(log->gpa);
-        uint64_t push_ver = GVM_NTOHLL(log->version);
+        struct wvm_diff_log* log = (struct wvm_diff_log*)payload;
+        uint64_t gpa = WVM_NTOHLL(log->gpa);
+        uint64_t push_ver = WVM_NTOHLL(log->version);
         uint64_t local_ver = get_local_page_version(gpa);
 
         // [FIX] 严格版本/幂等性校验
@@ -290,9 +290,9 @@ void gvm_apply_remote_push(uint16_t msg_type, void *payload) {
     }
     // --- 分支 2: 全页推送 / 强制同步 ---
     else if (msg_type == MSG_PAGE_PUSH_FULL || msg_type == MSG_FORCE_SYNC) {
-        struct gvm_full_page_push* full = (struct gvm_full_page_push*)payload;
-        uint64_t gpa = GVM_NTOHLL(full->gpa);
-        uint64_t push_ver = GVM_NTOHLL(full->version);
+        struct wvm_full_page_push* full = (struct wvm_full_page_push*)payload;
+        uint64_t gpa = WVM_NTOHLL(full->gpa);
+        uint64_t push_ver = WVM_NTOHLL(full->version);
         
         if (is_newer_version(get_local_page_version(gpa), push_ver)) {
             mprotect((uint8_t*)g_ram_base + gpa, 4096, PROT_READ | PROT_WRITE);
@@ -307,7 +307,7 @@ void gvm_apply_remote_push(uint16_t msg_type, void *payload) {
     // --- 分支 3: Prophet RPC (V29 新增) ---
     else if (msg_type == MSG_RPC_BATCH_MEMSET) {
         // RPC 指令通常意味着大范围内存变动，这里不做 Lazy 处理
-        // 让 giantvm-all.c 里的 tb_flush 去处理一致性
+        // 让 wavevm-all.c 里的 tb_flush 去处理一致性
         // 这里主要负责更新版本号（如果有必要）
         // 但注意：Prophet 的执行是在 handle_rpc_batch_execution 里直接写内存的
         // 这里收到的只是通知，通常不需要做 mprotect 操作，除非为了 invalidation
@@ -353,7 +353,7 @@ hit:
     
     pthread_spin_unlock(&g_reorder_lock);
 
-    gvm_apply_remote_push(t, d);
+    wvm_apply_remote_push(t, d);
     free(d);
     return true;
 }
@@ -363,10 +363,10 @@ static pthread_mutex_t g_writable_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 线程局部
 static __thread int t_com_sock = -1; 
-static __thread uint8_t t_net_buf[GVM_MAX_PACKET_SIZE]; 
+static __thread uint8_t t_net_buf[WVM_MAX_PACKET_SIZE]; 
 
 // --- 扩展 IPC 结构 (本地定义以匹配 Daemon 扩展) ---
-struct gvm_ipc_fault_ack {
+struct wvm_ipc_fault_ack {
     int status;
     uint64_t version; // [V29] 必须同步版本号
 };
@@ -437,11 +437,11 @@ static int internal_connect_master(void) {
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     
-    const char *env_path = getenv("GVM_ENV_SOCK_PATH");
+    const char *env_path = getenv("WVM_ENV_SOCK_PATH");
     if (!env_path) {
-        char *inst_id = getenv("GVM_INSTANCE_ID");
+        char *inst_id = getenv("WVM_INSTANCE_ID");
         static char fallback_path[128];
-        snprintf(fallback_path, sizeof(fallback_path), "/tmp/gvm_user_%s.sock", inst_id ? inst_id : "0");
+        snprintf(fallback_path, sizeof(fallback_path), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
         env_path = fallback_path;
     }
     strncpy(addr.sun_path, env_path, sizeof(addr.sun_path) - 1);
@@ -455,11 +455,11 @@ static int internal_connect_master(void) {
  * 以下函数仅为了兼容 QEMU 命令行参数解析。
  * V29 使用 Wavelet 主动推送模型，不再需要 TTL 和手工 Watch 区域。
  */
-void gvm_set_ttl_interval(int ms) { 
+void wvm_set_ttl_interval(int ms) { 
     // 留空：不再启动 V28 的收割者线程
 }
 
-void gvm_register_volatile_ram(uint64_t gpa, uint64_t size) { 
+void wvm_register_volatile_ram(uint64_t gpa, uint64_t size) { 
     // 留空：不再维护易失性区域链表
 }
 
@@ -479,15 +479,15 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
             if (t_com_sock < 0) return -1;
         }
         
-        struct gvm_ipc_fault_req req = { .gpa = gpa, .len = 4096, .vcpu_id = 0 };
-        struct gvm_ipc_header_t ipc_hdr = { .type = GVM_IPC_TYPE_MEM_FAULT, .len = sizeof(req) };
+        struct wvm_ipc_fault_req req = { .gpa = gpa, .len = 4096, .vcpu_id = 0 };
+        struct wvm_ipc_header_t ipc_hdr = { .type = WVM_IPC_TYPE_MEM_FAULT, .len = sizeof(req) };
         struct iovec iov[2] = { {&ipc_hdr, sizeof(ipc_hdr)}, {&req, sizeof(req)} };
         struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
         
         if (sendmsg(t_com_sock, &msg, 0) < 0) return -1;
         
         // [V29 Fix] 接收带版本的 ACK
-        struct gvm_ipc_fault_ack ack;
+        struct wvm_ipc_fault_ack ack;
         if (read_exact(t_com_sock, &ack, sizeof(ack)) < 0) return -1;
         
         if (ack.status == 0) {
@@ -507,20 +507,20 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
         // 1. 从主进程的全局 Socket (g_fd_req) "偷" 取目标 Proxy 地址
         // 这样每个线程都不需要重新解析配置文件，直接跟随主进程配置
         if (getpeername(g_fd_req, (struct sockaddr*)&peer_addr, &addr_len) < 0) {
-            safe_log("[GVM] FATAL: getpeername failed in thread init\n");
+            safe_log("[WVM] FATAL: getpeername failed in thread init\n");
             _exit(1);
         }
 
         // 2. 创建线程私有 UDP Socket
         t_req_sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (t_req_sock < 0) {
-            safe_log("[GVM] FATAL: Thread socket creation failed\n");
+            safe_log("[WVM] FATAL: Thread socket creation failed\n");
             _exit(1);
         }
 
         // 3. 独占连接到 Proxy (利用内核层过滤非目标流量)
         if (connect(t_req_sock, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
-            safe_log("[GVM] FATAL: Thread socket connect failed\n");
+            safe_log("[WVM] FATAL: Thread socket connect failed\n");
             close(t_req_sock); t_req_sock = -1;
             _exit(1);
         }
@@ -533,10 +533,10 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
     // ---------------------------------------------------------
     // [原版逻辑保留] 构造协议包 (使用 t_net_buf 替代全局 buffer)
     // ---------------------------------------------------------
-    struct gvm_header *hdr = (struct gvm_header *)t_net_buf;
-    memset(hdr, 0, sizeof(struct gvm_header)); // [保留] 必须清零
+    struct wvm_header *hdr = (struct wvm_header *)t_net_buf;
+    memset(hdr, 0, sizeof(struct wvm_header)); // [保留] 必须清零
 
-    hdr->magic = htonl(GVM_MAGIC);
+    hdr->magic = htonl(WVM_MAGIC);
     
     // [保留] 区分读写意图 (V29 协议中通常统一为 MEM_READ，但此处保留你的逻辑)
     // 注意：需确保 MSG_ACQUIRE_... 在 protocol.h 有定义，否则回退到 MSG_MEM_READ
@@ -548,16 +548,16 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
 
     hdr->payload_len = htons(8); 
     hdr->slave_id = htonl(g_slave_id);
-    hdr->req_id = GVM_HTONLL((uint64_t)gpa); 
+    hdr->req_id = WVM_HTONLL((uint64_t)gpa); 
     hdr->mode_tcg = 1; 
     hdr->qos_level = 1; 
 
     // [保留] Payload: GPA
-    *(uint64_t *)(t_net_buf + sizeof(struct gvm_header)) = GVM_HTONLL(gpa);
+    *(uint64_t *)(t_net_buf + sizeof(struct wvm_header)) = WVM_HTONLL(gpa);
 
     // [保留] CRC 计算
     hdr->crc32 = 0; 
-    uint32_t c = calculate_crc32(t_net_buf, sizeof(struct gvm_header) + 8);
+    uint32_t c = calculate_crc32(t_net_buf, sizeof(struct wvm_header) + 8);
     hdr->crc32 = htonl(c);
 
     // ---------------------------------------------------------
@@ -565,7 +565,7 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
     // ---------------------------------------------------------
     
     // 发送
-    if (send(t_req_sock, t_net_buf, sizeof(struct gvm_header) + 8, 0) < 0) {
+    if (send(t_req_sock, t_net_buf, sizeof(struct wvm_header) + 8, 0) < 0) {
         return -1; // 网络不可达
     }
 
@@ -580,11 +580,11 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
             total_wait_ms += 100;
             // [新增] 简单重传机制，防止 UDP 丢包死锁
             if (total_wait_ms % 500 == 0) {
-                send(t_req_sock, t_net_buf, sizeof(struct gvm_header) + 8, 0); 
+                send(t_req_sock, t_net_buf, sizeof(struct wvm_header) + 8, 0); 
             }
             if (total_wait_ms >= 5000) {
                 // 5秒无回音，打印日志但不退出，防止 Guest 崩溃
-                const char *msg = "[GVM] WARN: Page fault stuck > 5s\n";
+                const char *msg = "[WVM] WARN: Page fault stuck > 5s\n";
                 write(STDERR_FILENO, msg, strlen(msg));
                 total_wait_ms = 0;
             }
@@ -597,15 +597,15 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
         }
 
         // 接收
-        int n = recv(t_req_sock, t_net_buf, GVM_MAX_PACKET_SIZE, 0);
+        int n = recv(t_req_sock, t_net_buf, WVM_MAX_PACKET_SIZE, 0);
         if (n <= 0) continue; // 过滤空包
 
-        if (n >= sizeof(struct gvm_header)) {
-            struct gvm_header *rx = (struct gvm_header *)t_net_buf;
+        if (n >= sizeof(struct wvm_header)) {
+            struct wvm_header *rx = (struct wvm_header *)t_net_buf;
             
             // [保留] 校验
-            if (ntohl(rx->magic) != GVM_MAGIC) continue;
-            if (GVM_NTOHLL(rx->req_id) != gpa) continue; 
+            if (ntohl(rx->magic) != WVM_MAGIC) continue;
+            if (WVM_NTOHLL(rx->req_id) != gpa) continue; 
 
             // [新增] CRC 校验 (接收端也需要校验！)
             uint32_t remote_crc = ntohl(rx->crc32);
@@ -614,21 +614,21 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
 
             if (ntohs(rx->msg_type) == MSG_MEM_ACK) {
                 // [V29] 检查版本号 Payload (只多不少：解析更复杂的结构)
-                // 结构: Header + gvm_mem_ack_payload { gpa, version, data }
-                size_t expected_size = sizeof(struct gvm_header) + sizeof(struct gvm_mem_ack_payload);
+                // 结构: Header + wvm_mem_ack_payload { gpa, version, data }
+                size_t expected_size = sizeof(struct wvm_header) + sizeof(struct wvm_mem_ack_payload);
                 
                 if (n >= expected_size) {
-                    struct gvm_mem_ack_payload *payload = (struct gvm_mem_ack_payload*)(t_net_buf + sizeof(struct gvm_header));
+                    struct wvm_mem_ack_payload *payload = (struct wvm_mem_ack_payload*)(t_net_buf + sizeof(struct wvm_header));
                     
                     // 双重检查 Payload 内的 GPA
-                    if (GVM_NTOHLL(payload->gpa) != gpa) continue;
+                    if (WVM_NTOHLL(payload->gpa) != gpa) continue;
 
                     // [保留] 写入内存
                     mprotect((void*)aligned_addr, 4096, PROT_READ | PROT_WRITE);
                     memcpy((void*)aligned_addr, payload->data, 4096);
                     
                     // [V29 新增] 更新本地版本号
-                    uint64_t ver = GVM_NTOHLL(payload->version);
+                    uint64_t ver = WVM_NTOHLL(payload->version);
                     set_local_page_version(gpa, ver);
                     
                     return 0; // 成功
@@ -710,16 +710,16 @@ static void send_commit_diff_dual_mode(uint64_t gpa, uint16_t offset, uint16_t s
     if (g_fd_push < 0) return;
     
     // 1. 计算包大小
-    size_t pl_len = sizeof(struct gvm_diff_log) + size;
-    size_t pkt_len = sizeof(struct gvm_header) + pl_len;
+    size_t pl_len = sizeof(struct wvm_diff_log) + size;
+    size_t pkt_len = sizeof(struct wvm_header) + pl_len;
     
     // 2. 分配缓冲区
     uint8_t *buf = malloc(pkt_len);
     if (!buf) return;
 
     // 3. 填充 Header
-    struct gvm_header *hdr = (struct gvm_header *)buf;
-    hdr->magic = htonl(GVM_MAGIC);
+    struct wvm_header *hdr = (struct wvm_header *)buf;
+    hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_COMMIT_DIFF);
     hdr->payload_len = htons(pl_len);
     hdr->slave_id = htonl(g_slave_id);
@@ -729,10 +729,10 @@ static void send_commit_diff_dual_mode(uint64_t gpa, uint16_t offset, uint16_t s
     hdr->flags = 0;
 
     // 4. 填充 Payload (Diff Log)
-    struct gvm_diff_log *log = (struct gvm_diff_log *)(buf + sizeof(*hdr));
-    log->gpa = GVM_HTONLL(gpa);
+    struct wvm_diff_log *log = (struct wvm_diff_log *)(buf + sizeof(*hdr));
+    log->gpa = WVM_HTONLL(gpa);
     // 携带本地版本号供 Directory 校验
-    log->version = GVM_HTONLL(get_local_page_version(gpa));
+    log->version = WVM_HTONLL(get_local_page_version(gpa));
     log->offset = htons(offset);
     log->size = htons(size);
     memcpy(log->data, data, size);
@@ -767,8 +767,8 @@ static void flush_aggregator(void) {
 
 // 核心聚合函数：取代原有的 send_push_packet
 static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint16_t sz, void *data, uint8_t flags) {
-    size_t payload_len = sizeof(struct gvm_diff_log) + sz;
-    size_t needed = sizeof(struct gvm_header) + payload_len;
+    size_t payload_len = sizeof(struct wvm_diff_log) + sz;
+    size_t needed = sizeof(struct wvm_header) + payload_len;
     
     pthread_mutex_lock(&g_aggregator.lock);
     
@@ -781,16 +781,16 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
     if (needed > MTU_SIZE) {
         uint8_t *tmp = malloc(needed);
         if (!tmp) { pthread_mutex_unlock(&g_aggregator.lock); return; }
-        struct gvm_header *h = (struct gvm_header *)tmp;
-        h->magic = htonl(GVM_MAGIC);
+        struct wvm_header *h = (struct wvm_header *)tmp;
+        h->magic = htonl(WVM_MAGIC);
         h->msg_type = htons(MSG_COMMIT_DIFF);
         h->payload_len = htons(payload_len);
         h->slave_id = htonl(g_slave_id);
         h->flags = flags;
         h->crc32 = 0;
-        struct gvm_diff_log *l = (struct gvm_diff_log *)(tmp + sizeof(*h));
-        l->gpa = GVM_HTONLL(gpa);
-        l->version = GVM_HTONLL(version);
+        struct wvm_diff_log *l = (struct wvm_diff_log *)(tmp + sizeof(*h));
+        l->gpa = WVM_HTONLL(gpa);
+        l->version = WVM_HTONLL(version);
         l->offset = htons(off);
         l->size = htons(sz);
         if (sz > 0) memcpy(l->data, data, sz);
@@ -802,8 +802,8 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
     }
 
     // 填充到缓冲区
-    struct gvm_header *hdr = (struct gvm_header *)(g_aggregator.buf + g_aggregator.curr_offset);
-    hdr->magic = htonl(GVM_MAGIC);
+    struct wvm_header *hdr = (struct wvm_header *)(g_aggregator.buf + g_aggregator.curr_offset);
+    hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_COMMIT_DIFF);
     hdr->payload_len = htons(payload_len);
     hdr->slave_id = htonl(g_slave_id);
@@ -811,9 +811,9 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
     hdr->flags = flags;
     hdr->crc32 = 0;
 
-    struct gvm_diff_log *log = (struct gvm_diff_log *)(g_aggregator.buf + g_aggregator.curr_offset + sizeof(struct gvm_header));
-    log->gpa = GVM_HTONLL(gpa);
-    log->version = GVM_HTONLL(version);
+    struct wvm_diff_log *log = (struct wvm_diff_log *)(g_aggregator.buf + g_aggregator.curr_offset + sizeof(struct wvm_header));
+    log->gpa = WVM_HTONLL(gpa);
+    log->version = WVM_HTONLL(version);
     log->offset = htons(off);
     log->size = htons(sz);
     if (sz > 0) memcpy(log->data, data, sz);
@@ -880,7 +880,7 @@ static void *diff_harvester_thread_fn(void *arg) {
 
             if (is_page_all_zero(current_snapshot)) {
                 // 调用聚合器发送零页消息
-                add_to_aggregator(curr->gpa, ver + 1, 0, 0, NULL, GVM_FLAG_ZERO);
+                add_to_aggregator(curr->gpa, ver + 1, 0, 0, NULL, WVM_FLAG_ZERO);
                 set_local_page_version(curr->gpa, ver + 1);
             } else {
                 // [E] 计算 Diff (耗时操作，已移出临界区)
@@ -949,7 +949,7 @@ static void *diff_harvester_thread_fn(void *arg) {
 
 // 环形缓冲区，用于处理 IPC 流的粘包/拆包
 typedef struct {
-    uint8_t buffer[GVM_MAX_PACKET_SIZE * 4];
+    uint8_t buffer[WVM_MAX_PACKET_SIZE * 4];
     size_t head; // Read ptr
     size_t tail; // Write ptr
 } StreamBuffer;
@@ -987,16 +987,16 @@ static uint64_t get_us_time(void) {
 }
 
 // 导出配置接口
-void gvm_set_client_sync_mode(int batch_size, int auto_tune) {
+void wvm_set_client_sync_mode(int batch_size, int auto_tune) {
     if (batch_size > 0) g_client_sync_batch = batch_size;
     g_enable_auto_tuning = auto_tune;
     
     // 如果设为 1，通常意味着强一致性需求，关闭自动调优
     if (batch_size == 1) {
         g_enable_auto_tuning = 0;
-        printf("[GVM] Strict Consistency Mode Activated (Batch=1, No Tuning)\n");
+        printf("[WVM] Strict Consistency Mode Activated (Batch=1, No Tuning)\n");
     } else {
-        printf("[GVM] Sync Mode: Initial Batch=%d, AutoTuning=%d\n", 
+        printf("[WVM] Sync Mode: Initial Batch=%d, AutoTuning=%d\n", 
                batch_size, auto_tune);
     }
 }
@@ -1010,12 +1010,12 @@ static long wait_for_directory_ack_safe(void) {
     if (g_fd_push < 0) return -1;
 
     // 1. 准备发送 PING
-    struct gvm_header hdr;
+    struct wvm_header hdr;
     memset(&hdr, 0, sizeof(hdr));
-    hdr.magic = htonl(GVM_MAGIC);
+    hdr.magic = htonl(WVM_MAGIC);
     hdr.msg_type = htons(MSG_PING);
     hdr.slave_id = htonl(g_slave_id);
-    hdr.req_id = GVM_HTONLL(SYNC_MAGIC); // 特殊标记
+    hdr.req_id = WVM_HTONLL(SYNC_MAGIC); // 特殊标记
 
     // 2. 【关键】先加锁，重置状态位
     pthread_mutex_lock(&g_sync_lock);
@@ -1061,7 +1061,7 @@ static void *mem_push_listener_thread(void *arg) {
     uint64_t last_cleanup_us = 0;
     
     struct pollfd pfd = { .fd = g_fd_push, .events = POLLIN };
-    printf("[GVM] Async Push Listener Started (Streaming Mode + Lazy Flush).\n");
+    printf("[WVM] Async Push Listener Started (Streaming Mode + Lazy Flush).\n");
 
     while (g_threads_running) {
         // [Stage 0] 循环前冲刷
@@ -1103,19 +1103,19 @@ static void *mem_push_listener_thread(void *arg) {
         sb.tail += n;
 
         // [Stage 2] 批量解析与应用
-        while (sb.tail - sb.head >= sizeof(struct gvm_ipc_header_t)) {
-            struct gvm_ipc_header_t *ipc = (struct gvm_ipc_header_t *)(sb.buffer + sb.head);
-            size_t total_msg_len = sizeof(struct gvm_ipc_header_t) + ipc->len;
+        while (sb.tail - sb.head >= sizeof(struct wvm_ipc_header_t)) {
+            struct wvm_ipc_header_t *ipc = (struct wvm_ipc_header_t *)(sb.buffer + sb.head);
+            size_t total_msg_len = sizeof(struct wvm_ipc_header_t) + ipc->len;
 
             if (sb.tail - sb.head < total_msg_len) break; // 数据未收全，等待下一轮
 
-            // 指向 GVM 协议头
-            void *data = sb.buffer + sb.head + sizeof(struct gvm_ipc_header_t);
+            // 指向 WVM 协议头
+            void *data = sb.buffer + sb.head + sizeof(struct wvm_ipc_header_t);
             
             // 只有 INVALIDATE 类型的 IPC 消息才包含网络包数据
-            if (ipc->type == GVM_IPC_TYPE_INVALIDATE) {
-                struct gvm_header *hdr = (struct gvm_header *)data;
-                void *payload = data + sizeof(struct gvm_header);
+            if (ipc->type == WVM_IPC_TYPE_INVALIDATE) {
+                struct wvm_header *hdr = (struct wvm_header *)data;
+                void *payload = data + sizeof(struct wvm_header);
                 uint16_t msg_type = ntohs(hdr->msg_type);
                 
                 // [FIXED] 提取包长度，供乱序重排使用
@@ -1123,14 +1123,14 @@ static void *mem_push_listener_thread(void *arg) {
 
                 // --- 逻辑 A: Diff 推送 (带乱序处理) ---
                 if (msg_type == MSG_PAGE_PUSH_DIFF) {
-                    struct gvm_diff_log* log = (struct gvm_diff_log*)payload;
-                    uint64_t gpa = GVM_NTOHLL(log->gpa);
-                    uint64_t push_ver = GVM_NTOHLL(log->version);
+                    struct wvm_diff_log* log = (struct wvm_diff_log*)payload;
+                    uint64_t gpa = WVM_NTOHLL(log->gpa);
+                    uint64_t push_ver = WVM_NTOHLL(log->version);
                     uint64_t local_ver = get_local_page_version(gpa);
 
                     if (is_next_version(local_ver, push_ver)) {
                         // 顺序到达：直接应用 (内部调用 defer_ro_protect，保持 RW)
-                        gvm_apply_remote_push(msg_type, payload);
+                        wvm_apply_remote_push(msg_type, payload);
                         
                         // 链式反应：检查重排缓冲区是否有 v+2, v+3...
                         uint64_t next = push_ver + 1;
@@ -1152,15 +1152,15 @@ static void *mem_push_listener_thread(void *arg) {
                 } 
                 // --- 逻辑 B: 全页推送 / 强制同步 ---
                 else if (msg_type == MSG_PAGE_PUSH_FULL || msg_type == MSG_FORCE_SYNC) {
-                    gvm_apply_remote_push(msg_type, payload);
+                    wvm_apply_remote_push(msg_type, payload);
                 }
                 // --- 逻辑 C: Prophet RPC (V29 保留) ---
                 else if (msg_type == MSG_RPC_BATCH_MEMSET) {
                     // Prophet 通知。这里不需要 Lazy Flush，因为 RPC 执行通常是原子的
-                    gvm_apply_remote_push(msg_type, payload);
+                    wvm_apply_remote_push(msg_type, payload);
                 }
                 // --- 逻辑 D: 同步 ACK (Sync Batch 闭环) ---
-                else if (msg_type == MSG_MEM_ACK && GVM_NTOHLL(hdr->req_id) == SYNC_MAGIC) {
+                else if (msg_type == MSG_MEM_ACK && WVM_NTOHLL(hdr->req_id) == SYNC_MAGIC) {
                     // 收到 Directory 的确认，说明 sync_batch 内的所有 diff 都已落盘
                     // 唤醒 Harvester 线程继续发送下一批
                     pthread_mutex_lock(&g_sync_lock);
@@ -1185,7 +1185,7 @@ static void *mem_push_listener_thread(void *arg) {
 }
 
 // --- 初始化 ---
-void giantvm_user_mem_init(void *ram_ptr, size_t ram_size) {
+void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
     g_ram_base = ram_ptr;
     g_ram_size = ram_size;
 
@@ -1198,9 +1198,9 @@ void giantvm_user_mem_init(void *ram_ptr, size_t ram_size) {
 
     size_t num_pages = ram_size / 4096;
 
-    char *env_req = getenv("GVM_SOCK_REQ");
-    char *env_push = getenv("GVM_SOCK_PUSH");
-    char *env_id = getenv("GVM_SLAVE_ID");
+    char *env_req = getenv("WVM_SOCK_REQ");
+    char *env_push = getenv("WVM_SOCK_PUSH");
+    char *env_id = getenv("WVM_SLAVE_ID");
 
     if (env_req && env_push) {
         g_is_slave = 1;
@@ -1208,7 +1208,7 @@ void giantvm_user_mem_init(void *ram_ptr, size_t ram_size) {
         g_fd_push = atoi(env_push);
         g_slave_id = env_id ? atoi(env_id) : 0;
         
-        printf("[GiantVM-User] V29 Wavelet Engine Active (Slave ID: %d)\n", g_slave_id);
+        printf("[WaveVM-User] V29 Wavelet Engine Active (Slave ID: %d)\n", g_slave_id);
         
         g_threads_running = true;
         pthread_create(&g_listen_thread, NULL, mem_push_listener_thread, NULL);

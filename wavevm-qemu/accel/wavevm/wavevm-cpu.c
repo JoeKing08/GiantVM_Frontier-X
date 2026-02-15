@@ -6,8 +6,9 @@
 #include "linux/kvm.h"
 #include "qemu/main-loop.h"
 #include "exec/address-spaces.h"
-#include "giantvm_protocol.h" 
-#include "giantvm_config.h"
+#include "../../../common_include/wavevm_protocol.h" 
+#include "../../../common_include/wavevm_config.h"
+#include "wavevm-accel.h"
 #include "qemu/thread.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,32 +18,32 @@
 static int *g_vcpu_socks = NULL;
 static int g_configured_vcpus = 0;
 
-// TCG Helper Declarations (Defined in giantvm-tcg.c)
-extern void gvm_tcg_get_state(CPUState *cpu, gvm_tcg_context_t *ctx);
-extern void gvm_tcg_set_state(CPUState *cpu, gvm_tcg_context_t *ctx);
+// TCG Helper Declarations (Defined in wavevm-tcg.c)
+extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
+extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 
-// 引用 giantvm-all.c 中定义的全局变量
-extern int g_gvm_local_split;
+// 引用 wavevm-all.c 中定义的全局变量
+extern int g_wvm_local_split;
 
-struct giantvm_policy_ops {
+struct wavevm_policy_ops {
     int (*schedule_policy)(int cpu_index);
 };
 
 // [Policy] Tiered Scheduling: Local vs Remote
 static int remote_rpc_policy(int cpu_index) {
-    //不再使用 GVM_LOCAL_CPU_COUNT 宏，而是使用动态变量
-    if (cpu_index >= g_gvm_local_split) return 1; // 远程执行
+    //不再使用 WVM_LOCAL_CPU_COUNT 宏，而是使用动态变量
+    if (cpu_index >= g_wvm_local_split) return 1; // 远程执行
     return 0; // 本地执行
 }
 
-static struct giantvm_policy_ops ops = { .schedule_policy = remote_rpc_policy };
+static struct wavevm_policy_ops ops = { .schedule_policy = remote_rpc_policy };
 
 /* 
  * [物理意图] 充当远程 Slave 的“本地代理执行人”。
  * [关键逻辑] 当远程计算节点触发 PIO/MMIO 退出时，Master 在本地 QEMU 中代为执行该 I/O 操作并返回结果。
  * [后果] 解决了 I/O 设备物理位置的透明性。它让 Guest 以为显卡就在本地，即便真实的读写指令是在千里之外执行的。
  */
-static void giantvm_handle_io(CPUState *cpu) {
+static void wavevm_handle_io(CPUState *cpu) {
     struct kvm_run *run = cpu->kvm_run;
     uint16_t port = run->io.port;
     void *data = (uint8_t *)run + run->io.data_offset;
@@ -52,7 +53,7 @@ static void giantvm_handle_io(CPUState *cpu) {
                      run->io.direction == KVM_EXIT_IO_OUT);
 }
 
-static void giantvm_handle_mmio(CPUState *cpu) {
+static void wavevm_handle_mmio(CPUState *cpu) {
     struct kvm_run *run = cpu->kvm_run;
     hwaddr addr = run->mmio.phys_addr;
     void *data = run->mmio.data;
@@ -67,7 +68,7 @@ static void giantvm_handle_mmio(CPUState *cpu) {
  * [关键逻辑] 将 CPU 的全量寄存器状态、MSR 及时钟计数器进行二进制打包，并发射至远程 Slave。
  * [后果] 实现了算力的透明流动。若序列化逻辑不严谨（如漏掉 rflags），远程执行会立即触发 Guest Kernel Panic。
  */
-static void giantvm_remote_exec(CPUState *cpu) {
+static void wavevm_remote_exec(CPUState *cpu) {
     // 动态边界检查
     if (cpu->cpu_index >= g_configured_vcpus) return;
     
@@ -75,18 +76,18 @@ static void giantvm_remote_exec(CPUState *cpu) {
     
     // 如果没有 socket (说明是 Kernel Mode), 走 IOCTL 路径
     if (vcpu_sock < 0) { 
-        GiantVMAccelState *s = GIANTVM_ACCEL(current_machine->accelerator);
-        if (s->mode != GVM_MODE_KERNEL) {
+        WaveVMAccelState *s = WAVEVM_ACCEL(current_machine->accelerator);
+        if (s->mode != WVM_MODE_KERNEL) {
             g_usleep(1000); // 异常状态，非 Kernel 且无 Socket
             return;
         }
 
         // 1. 准备请求结构体
-        struct gvm_ipc_cpu_run_req req;
-        struct gvm_ipc_cpu_run_ack ack;
+        struct wvm_ipc_cpu_run_req req;
+        struct wvm_ipc_cpu_run_ack ack;
         memset(&req, 0, sizeof(req));
         
-        req.slave_id = GVM_NODE_AUTO_ROUTE;
+        req.slave_id = WVM_NODE_AUTO_ROUTE;
 
         // 2. 序列化 CPU 状态
         if (kvm_enabled()) {
@@ -107,15 +108,15 @@ static void giantvm_remote_exec(CPUState *cpu) {
             memcpy(req.ctx.kvm.sregs_data, &ksregs, sizeof(ksregs));
         } else {
             req.mode_tcg = 1;
-            gvm_tcg_get_state(cpu, &req.ctx.tcg);
+            wvm_tcg_get_state(cpu, &req.ctx.tcg);
         }
 
         // 3. 陷入内核 (Trap into Kernel)
         // 这一步会阻塞，直到远程执行完毕并返回结果
-        int ret = ioctl(s->dev_fd, IOCTL_GVM_REMOTE_RUN, &req);
+        int ret = ioctl(s->dev_fd, IOCTL_WVM_REMOTE_RUN, &req);
         
         if (ret < 0) {
-            //fprintf(stderr, "GiantVM: Remote Run IOCTL failed: %s\n", strerror(errno));
+            //fprintf(stderr, "WaveVM: Remote Run IOCTL failed: %s\n", strerror(errno));
             return;
         }
 
@@ -124,11 +125,11 @@ static void giantvm_remote_exec(CPUState *cpu) {
         memcpy(&ack, &req, sizeof(ack)); 
 
         if (ack.mode_tcg) {
-            gvm_tcg_set_state(cpu, &ack.ctx.tcg);
+            wvm_tcg_set_state(cpu, &ack.ctx.tcg);
         } else {
             struct kvm_regs kregs;
             struct kvm_sregs ksregs;
-            gvm_kvm_context_t *kctx = &ack.ctx.kvm;
+            wvm_kvm_context_t *kctx = &ack.ctx.kvm;
 
             kregs.rax = kctx->rax; kregs.rbx = kctx->rbx; kregs.rcx = kctx->rcx; 
             kregs.rdx = kctx->rdx; kregs.rsi = kctx->rsi; kregs.rdi = kctx->rdi;
@@ -158,7 +159,7 @@ static void giantvm_remote_exec(CPUState *cpu) {
                     }
                 }
                 qemu_mutex_lock_iothread();
-                giantvm_handle_io(cpu);
+                wavevm_handle_io(cpu);
                 qemu_mutex_unlock_iothread();
             } 
             else if (kctx->exit_reason == KVM_EXIT_MMIO) {
@@ -167,7 +168,7 @@ static void giantvm_remote_exec(CPUState *cpu) {
                 run->mmio.is_write  = kctx->exit_info.mmio.is_write;
                 memcpy(run->mmio.data, kctx->exit_info.mmio.data, 8);
                 qemu_mutex_lock_iothread();
-                giantvm_handle_mmio(cpu);
+                wavevm_handle_mmio(cpu);
                 qemu_mutex_unlock_iothread();
             }
         }
@@ -176,18 +177,18 @@ static void giantvm_remote_exec(CPUState *cpu) {
 
     // 准备发送缓冲区
     uint8_t buf[16384]; //需要调大一点点
-    struct gvm_header *hdr = (struct gvm_header *)buf;
-    struct gvm_ipc_cpu_run_req *req = (struct gvm_ipc_cpu_run_req *)(buf + sizeof(struct gvm_header));
-    req->slave_id = GVM_NODE_AUTO_ROUTE; 
+    struct wvm_header *hdr = (struct wvm_header *)buf;
+    struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)(buf + sizeof(struct wvm_header));
+    req->slave_id = WVM_NODE_AUTO_ROUTE; 
     req->vcpu_index = cpu->cpu_index;
     
-    uint32_t target_slave = GVM_NODE_AUTO_ROUTE; 
+    uint32_t target_slave = WVM_NODE_AUTO_ROUTE; 
 
-    hdr->magic = GVM_MAGIC;
+    hdr->magic = WVM_MAGIC;
     hdr->msg_type = MSG_VCPU_RUN;
     hdr->slave_id = target_slave;
     // 使用全1作为异步标记，避开 GPA 0
-    hdr->req_id = GVM_HTONLL(~0ULL);
+    hdr->req_id = WVM_HTONLL(~0ULL);
     hdr->is_frag = 0;
 
     // 将 vCPU ID 埋入 Payload 的冗余字段中，供 Slave 端的 Proxy 负载均衡使用
@@ -202,9 +203,9 @@ static void giantvm_remote_exec(CPUState *cpu) {
         ioctl(cpu->kvm_fd, KVM_GET_SREGS, &ksregs);
 
         hdr->mode_tcg = 0;
-        hdr->payload_len = sizeof(gvm_kvm_context_t);
+        hdr->payload_len = sizeof(wvm_kvm_context_t);
         
-        gvm_kvm_context_t *kctx = &req->ctx.kvm;
+        wvm_kvm_context_t *kctx = &req->ctx.kvm;
         kctx->rax = kregs.rax; kctx->rbx = kregs.rbx; kctx->rcx = kregs.rcx;
         kctx->rdx = kregs.rdx; kctx->rsi = kregs.rsi; kctx->rdi = kregs.rdi;
         kctx->rsp = kregs.rsp; kctx->rbp = kregs.rbp;
@@ -215,12 +216,12 @@ static void giantvm_remote_exec(CPUState *cpu) {
         memcpy(kctx->sregs_data, &ksregs, sizeof(ksregs));
     } else {
         hdr->mode_tcg = 1;
-        hdr->payload_len = sizeof(gvm_tcg_context_t);
-        gvm_tcg_get_state(cpu, &req->ctx.tcg);
+        hdr->payload_len = sizeof(wvm_tcg_context_t);
+        wvm_tcg_get_state(cpu, &req->ctx.tcg);
     }
 
     // 2. 网络发送 (Lock-Free)
-    size_t packet_len = sizeof(struct gvm_header) + hdr->payload_len;
+    size_t packet_len = sizeof(struct wvm_header) + hdr->payload_len;
     // [V25.4 REMOVED] qemu_mutex_lock(&s->ipc_lock);
     if (write(vcpu_sock, buf, packet_len) != packet_len) {
         // Log error or handle reconnect
@@ -230,17 +231,17 @@ static void giantvm_remote_exec(CPUState *cpu) {
     // 3. 网络接收 (阻塞本线程，不影响其他 vCPU)
     ssize_t len = read(vcpu_sock, buf, sizeof(buf));
     
-    if (len < sizeof(struct gvm_header)) return;
+    if (len < sizeof(struct wvm_header)) return;
     
     // 4. 反序列化 CPU 状态
-    struct gvm_ipc_cpu_run_ack *ack = (struct gvm_ipc_cpu_run_ack *)(buf + sizeof(struct gvm_header));
+    struct wvm_ipc_cpu_run_ack *ack = (struct wvm_ipc_cpu_run_ack *)(buf + sizeof(struct wvm_header));
 
     if (ack->mode_tcg) {
-        gvm_tcg_set_state(cpu, &ack->ctx.tcg);
+        wvm_tcg_set_state(cpu, &ack->ctx.tcg);
     } else {
         struct kvm_regs kregs;
         struct kvm_sregs ksregs;
-        gvm_kvm_context_t *kctx = &ack->ctx.kvm;
+        wvm_kvm_context_t *kctx = &ack->ctx.kvm;
 
         kregs.rax = kctx->rax; kregs.rbx = kctx->rbx; kregs.rcx = kctx->rcx; 
         kregs.rdx = kctx->rdx; kregs.rsi = kctx->rsi; kregs.rdi = kctx->rdi;
@@ -271,14 +272,14 @@ static void giantvm_remote_exec(CPUState *cpu) {
                     memcpy(io_ptr, kctx->exit_info.io.data, run->io.size * run->io.count);
                 }
             }
-            giantvm_handle_io(cpu);
+            wavevm_handle_io(cpu);
         } 
         else if (kctx->exit_reason == KVM_EXIT_MMIO) {
             run->mmio.phys_addr = kctx->exit_info.mmio.phys_addr;
             run->mmio.len       = kctx->exit_info.mmio.len;
             run->mmio.is_write  = kctx->exit_info.mmio.is_write;
             memcpy(run->mmio.data, kctx->exit_info.mmio.data, 8);
-            giantvm_handle_mmio(cpu);
+            wavevm_handle_mmio(cpu);
         }
     }
 }
@@ -288,7 +289,7 @@ static void giantvm_remote_exec(CPUState *cpu) {
  * [关键逻辑] 拦截标准的 KVM_RUN 循环，根据调度策略决定本轮指令是交给本地 KVM 还是进行远程上下文序列化。
  * [后果] 这是超级虚拟机的总节拍器。它保证了在异构算力环境下，vCPU 能够平滑地在本地与远程之间切换执行流。
  */
-static void *giantvm_cpu_thread_fn(void *arg) {
+static void *wavevm_cpu_thread_fn(void *arg) {
     CPUState *cpu = arg;
     int ret;
 
@@ -305,7 +306,7 @@ static void *giantvm_cpu_thread_fn(void *arg) {
         if (cpu->unplug || cpu->stop) break;
 
         if (ops.schedule_policy(cpu->cpu_index) == 1) {
-            giantvm_remote_exec(cpu);
+            wavevm_remote_exec(cpu);
             continue;
         }
 
@@ -323,8 +324,8 @@ static void *giantvm_cpu_thread_fn(void *arg) {
                 
                 struct kvm_run *run = cpu->kvm_run;
                 switch (run->exit_reason) {
-                    case KVM_EXIT_IO: giantvm_handle_io(cpu); break;
-                    case KVM_EXIT_MMIO: giantvm_handle_mmio(cpu); break;
+                    case KVM_EXIT_IO: wavevm_handle_io(cpu); break;
+                    case KVM_EXIT_MMIO: wavevm_handle_mmio(cpu); break;
                     case KVM_EXIT_SHUTDOWN: 
                         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
                         goto out;
@@ -356,10 +357,10 @@ extern int connect_to_master_helper(void);
  * [关键逻辑] 在 vCPU 创建瞬间建立独立的 IPC 通道，彻底消除多核并发时的 Socket 锁竞争。
  * [后果] 实现了算力的线性扩展能力。这是 V30 支撑一亿核心的关键，保证了 vCPU 数量增加时通信延迟不上升。
  */
-void giantvm_start_vcpu_thread(CPUState *cpu) {
+void wavevm_start_vcpu_thread(CPUState *cpu) {
     char thread_name[VCPU_THREAD_NAME_SIZE];
-    GiantVMAccelState *s = GIANTVM_ACCEL(current_machine->accelerator);
-    char *role = getenv("GVM_ROLE");
+    WaveVMAccelState *s = WAVEVM_ACCEL(current_machine->accelerator);
+    char *role = getenv("WVM_ROLE");
 
     static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
     
@@ -379,7 +380,7 @@ void giantvm_start_vcpu_thread(CPUState *cpu) {
         pthread_mutex_unlock(&g_init_lock);
     }
 
-    if (s->mode == GVM_MODE_USER && !(role && strcmp(role, "SLAVE") == 0)) {
+    if (s->mode == WVM_MODE_USER && !(role && strcmp(role, "SLAVE") == 0)) {
         // 动态边界检查
         if (cpu->cpu_index < g_configured_vcpus) {
             g_vcpu_socks[cpu->cpu_index] = connect_to_master_helper();
@@ -397,8 +398,7 @@ void giantvm_start_vcpu_thread(CPUState *cpu) {
     cpu->halt_cond = g_malloc0(sizeof(QemuCond));
     qemu_cond_init(cpu->halt_cond);
     
-    snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "CPU %d/GVM", cpu->cpu_index);
+    snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "CPU %d/WVM", cpu->cpu_index);
     
-    qemu_thread_create(cpu->thread, thread_name, giantvm_cpu_thread_fn, cpu, QEMU_THREAD_JOINABLE);
+    qemu_thread_create(cpu->thread, thread_name, wavevm_cpu_thread_fn, cpu, QEMU_THREAD_JOINABLE);
 }
-
