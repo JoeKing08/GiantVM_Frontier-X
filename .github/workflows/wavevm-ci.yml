@@ -1,0 +1,112 @@
+name: wavevm-ci
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_modeb_smoke:
+        description: "Run Mode B multi-instance smoke test"
+        type: boolean
+        required: true
+        default: true
+      run_modea_probe:
+        description: "Run Mode A/KVM environment probe (non-blocking)"
+        type: boolean
+        required: true
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make gcc
+
+      - name: Build all core binaries
+        run: |
+          make -C gateway_service
+          make -C slave_daemon
+          make -C ctl_tool
+          make -C master_core -f Makefile_User
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wavevm-binaries
+          path: |
+            gateway_service/wavevm_gateway
+            slave_daemon/wavevm_node_slave
+            ctl_tool/wvm_ctl
+            master_core/wavevm_node_master
+          if-no-files-found: error
+
+  modeb-smoke:
+    runs-on: ubuntu-22.04
+    needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_modeb_smoke }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make gcc
+
+      - name: Build binaries
+        run: |
+          make -C gateway_service
+          make -C slave_daemon
+          make -C ctl_tool
+          make -C master_core -f Makefile_User
+
+      - name: Run Mode B multi-instance smoke
+        run: bash deploy/ci_modeb_multi_smoke.sh
+
+      - name: Upload Mode B smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modeb-smoke-logs
+          path: artifacts/
+          if-no-files-found: warn
+
+  modea-probe:
+    runs-on: ubuntu-22.04
+    needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_modea_probe }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe KVM / kernel build environment
+        run: |
+          set -euo pipefail
+          echo "Kernel: $(uname -r)"
+          if [[ -e /dev/kvm ]]; then
+            echo "[INFO] /dev/kvm exists"
+            ls -l /dev/kvm
+          else
+            echo "[WARN] /dev/kvm not found"
+          fi
+
+          if command -v lsmod >/dev/null 2>&1; then
+            lsmod | grep -E '^kvm(_intel|_amd)?' || echo "[WARN] kvm module not loaded"
+          else
+            echo "[WARN] lsmod unavailable"
+          fi
+
+          if [[ -d /lib/modules/$(uname -r)/build ]]; then
+            echo "[INFO] kernel headers present"
+          else
+            echo "[WARN] kernel headers missing: /lib/modules/$(uname -r)/build"
+          fi
+
+          echo "[NOTE] Mode A probe is informational and does not fail the workflow."
