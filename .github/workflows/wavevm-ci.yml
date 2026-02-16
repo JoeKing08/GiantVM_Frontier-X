@@ -11,8 +11,8 @@ on:
         type: boolean
         required: true
         default: true
-      run_modea_probe:
-        description: "Run Mode A/KVM environment probe (non-blocking)"
+      run_modea_smoke:
+        description: "Run Mode A smoke test (requires /dev/kvm + module load capability)"
         type: boolean
         required: true
         default: true
@@ -78,35 +78,32 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
 
-  modea-probe:
+  modea-smoke:
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_modea_probe }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_modea_smoke }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Probe KVM / kernel build environment
+      - name: Install Mode A deps
         run: |
-          set -euo pipefail
-          echo "Kernel: $(uname -r)"
-          if [[ -e /dev/kvm ]]; then
-            echo "[INFO] /dev/kvm exists"
-            ls -l /dev/kvm
-          else
-            echo "[WARN] /dev/kvm not found"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y build-essential make gcc kmod
+          sudo apt-get install -y "linux-headers-$(uname -r)" || true
 
-          if command -v lsmod >/dev/null 2>&1; then
-            lsmod | grep -E '^kvm(_intel|_amd)?' || echo "[WARN] kvm module not loaded"
-          else
-            echo "[WARN] lsmod unavailable"
-          fi
+      - name: Build binaries
+        run: |
+          make -C slave_daemon
+          make -C master_core -f Makefile_User
 
-          if [[ -d /lib/modules/$(uname -r)/build ]]; then
-            echo "[INFO] kernel headers present"
-          else
-            echo "[WARN] kernel headers missing: /lib/modules/$(uname -r)/build"
-          fi
+      - name: Run Mode A smoke
+        run: bash deploy/ci_modea_smoke.sh
 
-          echo "[NOTE] Mode A probe is informational and does not fail the workflow."
+      - name: Upload Mode A smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modea-smoke-logs
+          path: artifacts/
+          if-no-files-found: warn
