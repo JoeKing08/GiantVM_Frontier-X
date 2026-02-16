@@ -83,7 +83,7 @@ V30.0 不再将物理计算节点视为单一的进程，而是定义为由 **�
 *   **物理入口**：监听物理端口（如 9000）。它是网关和邻居节点眼中该 ID 的唯一代表。
 *   **流量分流器 (Ingress Dispatcher)**：这是 V30.0 的核心逻辑。
     *   **代码事实**：`user_backend.c` 和 `kernel_backend.c` 拦截收到的数据包。如果是 `MSG_VCPU_RUN` 或 `MSG_BLOCK_WRITE/READ`，Master 不处理，直接通过 `127.0.0.1` 转发给本地 Slave 端口。
-*   **Directory 节点 (The Truth)**：管理 `g_dir_table` (64M Entries)。
+*   **Directory 节点 (The Truth)**：管理 `g_dir_table`（当前主线默认：用户态 `64K`，内核态 smoke 路径 `4K`）。
     *   **代码事实**：使用 `MurmurHash3` 将 GPA 映射到 Owner。维护订阅位图 `subscribers`。
 *   **元数据同步 (Gossip)**：通过 `autonomous_monitor_thread` 随机向邻居扩散视图，实现 Epoch 的最终共识。
 
@@ -1129,7 +1129,7 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
  * ---------------------------------------------------------------------------
  * 物理角色：定义整个系统的"物理常数"和寻址边界。
  * 职责边界：
- * 1. 设定 WVM_SLAVE_BITS (20位ID空间)，支撑百万级虚拟节点。
+ * 1. 设定 WVM_SLAVE_BITS（当前默认 12 位单 Pod 空间）。
  * 2. 规定内存粒度 (1GB 路由 / 2MB 订阅 / 4KB 一致性)。
  * 3. 设定物理 MTU (1400)，规避 Overlay 网络的 IP 分片。
  * 
@@ -1143,20 +1143,20 @@ echo "[SUCCESS] Kernel parameters are tuned for V29 'Wavelet' deployment."
 
 /* 
  * [集群规模上限] 定义节点 ID 的位宽。
- * 设定为 20 位，意味着支持 2^20 = 1,048,576 个逻辑节点 ID。
- * 在分形架构中，这对应于全网唯一的虚拟节点 ID (Virtual ID)。
+ * 当前默认 12 位，意味着支持 2^12 = 4096 个逻辑节点 ID。
+ * 在分形架构中，这对应单 Pod 的虚拟节点 ID 空间。
  * 注意：如果将其调大，需要同步调整网关的路由表内存分配大小。
  */
 #ifndef WVM_SLAVE_BITS
 /*
  * Default node-id bit width.
- * Userspace may target million-node scale; the in-kernel smoke-test path must
- * keep static allocations bounded (copyset_t/page_meta_t lives in-memory).
+ * Kernel / userspace currently aligned at 12 for single-Pod capacity.
+ * If increased, gateway memory mapping and related tables must be reviewed.
  */
 #ifdef __KERNEL__
 #define WVM_SLAVE_BITS 12
 #else
-#define WVM_SLAVE_BITS 20
+#define WVM_SLAVE_BITS 12
 #endif
 #endif
 
