@@ -1,26 +1,26 @@
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bac2d6fa2..98e0b5502 100644
 --- a/hw/block/virtio-blk.c
 +++ b/hw/block/virtio-blk.c
-@@ -20,6 +20,10 @@
+@@ -26,6 +26,8 @@
  #include "hw/virtio/virtio-blk.h"
  #include "dataplane/virtio-blk.h"
  #include "scsi/constants.h"
 +
-+// [WaveVM Hook] 声明外部拦截器
 +extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
-+
  #ifdef __linux__
- #include <sys/ioctl.h>
+ # include <scsi/sg.h>
  #endif
-@@ -252,6 +256,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
-         return -1;
-     }
+@@ -672,6 +674,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+                                          req->qiov.size / BDRV_SECTOR_SIZE);
+         }
  
-+    // [WaveVM V31] 尝试分布式存储拦截
-+    // 如果拦截成功(返回0)，则直接返回，不再执行本地 IO
-+    if (wavevm_blk_interceptor(req->out.sector, &req->qiov, (type & VIRTIO_BLK_T_OUT)) == 0) {
-+        return 0;
-+    }
++        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
++            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
++            virtio_blk_free_request(req);
++            return 0;
++        }
 +
-     if (is_write && type == VIRTIO_BLK_T_FLUSH) {
-         virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
-         return 0;
+         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {
+             virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
+             block_acct_invalid(blk_get_stats(s->blk),

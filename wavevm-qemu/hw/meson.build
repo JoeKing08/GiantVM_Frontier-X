@@ -39,6 +39,7 @@ subdir('usb')
 subdir('vfio')
 subdir('virtio')
 subdir('watchdog')
+subdir('wavevm')
 subdir('xen')
 subdir('xenpv')
 

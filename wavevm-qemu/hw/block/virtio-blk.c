@@ -26,6 +26,8 @@
 #include "hw/virtio/virtio-blk.h"
 #include "dataplane/virtio-blk.h"
 #include "scsi/constants.h"
+
+extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
 #ifdef __linux__
 # include <scsi/sg.h>
 #endif
@@ -670,6 +672,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
             qemu_iovec_init_external(&req->qiov, in_iov, in_num);
             trace_virtio_blk_handle_read(vdev, req, req->sector_num,
                                          req->qiov.size / BDRV_SECTOR_SIZE);
+        }
+
+        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
+            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
+            virtio_blk_free_request(req);
+            return 0;
         }
 
         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {

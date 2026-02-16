@@ -13348,11 +13348,14 @@ clean:
     # 产出：wvm_ctl (权重映射工具)
     ```
 
-6.  **应用物理拦截补丁**
+6.  **应用 QEMU 物理拦截补丁（必须两个）**
     ```bash
     cd wavevm-qemu
-    # 物理意义：在 virtio-blk 源码层注入 WaveVM 分布式拦截器
+    # Patch A: 在 virtio-blk 源码层注入 WaveVM 分布式拦截器
     patch -p1 < ../qemu_patch/virtio-blk.diff
+
+    # Patch B: 将 wavevm hook 代码纳入 hw/meson 构建图
+    patch -p1 < ../qemu_patch/hw-wavevm.diff
     ```
 
 7.  **配置并编译 QEMU-Wavelet**
@@ -13418,3 +13421,154 @@ clean:
 4.  **现象与判断**
     *   `Severe Congestion` 计数持续增长（所有节点近似同斜率），但控制面邻接与进程存活稳定。
     *   结论：当前瓶颈主要指向公网带宽/链路质量与参数调优，不是架构性断链问题。
+
+---
+
+## 🧩 2026-02-16 QEMU 5.2.0 可复现补丁归档
+
+结论先行：
+- 仅有 `qemu` 源码 + 本文档还不够，想稳定复现出与当前一致的产物，需要满足同一套依赖与构建参数。
+- 在满足下列条件时，可构建出当前同版本产物：`qemu-system-x86_64 (QEMU emulator version 5.2.0)`。
+
+### 复现前提
+
+1. 基线源码：`wavevm-qemu`（QEMU 5.2.0 树）。
+2. 依赖包（Debian/Ubuntu）：
+   - `ninja-build`
+   - `libglib2.0-dev`
+   - `libpixman-1-dev`
+   - `libfdt-dev`
+   - `zlib1g-dev`
+3. 配置参数保持一致：
+   - `./configure --target-list=x86_64-softmmu --enable-kvm --enable-debug`
+4. 编译目标保持一致：
+   - `make -j$(nproc) qemu-system-x86_64`
+
+### 补丁文件
+
+- `qemu_patch/virtio-blk.diff`
+- `qemu_patch/hw-wavevm.diff`
+
+### 应用方式（从仓库根目录）
+
+```bash
+cd wavevm-qemu
+patch -p1 < ../qemu_patch/virtio-blk.diff
+patch -p1 < ../qemu_patch/hw-wavevm.diff
+./configure --target-list=x86_64-softmmu --enable-kvm --enable-debug
+make -j$(nproc) qemu-system-x86_64
+./qemu-system-x86_64 --version
+```
+
+### qemu_patch/virtio-blk.diff
+
+```diff
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bac2d6fa2..98e0b5502 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -26,6 +26,8 @@
+ #include "hw/virtio/virtio-blk.h"
+ #include "dataplane/virtio-blk.h"
+ #include "scsi/constants.h"
++
++extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
+ #ifdef __linux__
+ # include <scsi/sg.h>
+ #endif
+@@ -672,6 +674,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+                                          req->qiov.size / BDRV_SECTOR_SIZE);
+         }
+ 
++        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
++            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
++            virtio_blk_free_request(req);
++            return 0;
++        }
++
+         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {
+             virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
+             block_acct_invalid(blk_get_stats(s->blk),
+```
+
+### qemu_patch/hw-wavevm.diff
+
+```diff
+diff --git a/hw/meson.build b/hw/meson.build
+index 010de7219..e2cd60b30 100644
+--- a/hw/meson.build
++++ b/hw/meson.build
+@@ -39,6 +39,7 @@ subdir('usb')
+ subdir('vfio')
+ subdir('virtio')
+ subdir('watchdog')
++subdir('wavevm')
+ subdir('xen')
+ subdir('xenpv')
+ 
+diff --git a/hw/wavevm/meson.build b/hw/wavevm/meson.build
+new file mode 100644
+index 000000000..1494f023f
+--- /dev/null
++++ b/hw/wavevm/meson.build
+@@ -0,0 +1,3 @@
++softmmu_ss.add(files(
++  'wavevm-block-hook.c',
++))
+diff --git a/hw/wavevm/wavevm-block-hook.c b/hw/wavevm/wavevm-block-hook.c
+new file mode 100644
+index 000000000..b2af780be
+--- /dev/null
++++ b/hw/wavevm/wavevm-block-hook.c
+@@ -0,0 +1,44 @@
++#include "qemu/osdep.h"
++#include "qemu/iov.h"
++
++/*
++ * virtio-blk hook entry point. Returns 0 when the request is handled by the
++ * WaveVM IPC path. Returns -1 to let virtio-blk use its normal local path.
++ */
++int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
++
++extern int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write)
++    __attribute__((weak));
++
++int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write)
++{
++    size_t total_len = qiov->size;
++    uint8_t *linear_buf;
++    int ret;
++
++    if (total_len == 0 || total_len > UINT32_MAX) {
++        return -1;
++    }
++
++    linear_buf = g_malloc(total_len);
++    if (!linear_buf) {
++        return -1;
++    }
++
++    if (is_write) {
++        qemu_iovec_to_buf(qiov, 0, linear_buf, total_len);
++    }
++
++    if (!wvm_send_ipc_block_io) {
++        g_free(linear_buf);
++        return -1;
++    }
++
++    ret = wvm_send_ipc_block_io(sector, linear_buf, (uint32_t)total_len, is_write);
++    if (!is_write && ret == 0) {
++        qemu_iovec_from_buf(qiov, 0, linear_buf, total_len);
++    }
++
++    g_free(linear_buf);
++    return ret;
++}
+```
+
+### 本次实机验证结果（2026-02-16）
+
+- 全新目录验证：`wavevm-qemu/build-verify`（已清理）
+- 增量验证目录：`wavevm-qemu/build`
+- 最终版本输出：`QEMU emulator version 5.2.0`
