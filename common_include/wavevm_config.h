@@ -3,7 +3,7 @@
  * ---------------------------------------------------------------------------
  * 物理角色：定义整个系统的"物理常数"和寻址边界。
  * 职责边界：
- * 1. 设定 WVM_SLAVE_BITS (20位ID空间)，支撑百万级虚拟节点。
+ * 1. 设定 WVM_SLAVE_BITS（默认 12 位单 Pod 空间）。
  * 2. 规定内存粒度 (1GB 路由 / 2MB 订阅 / 4KB 一致性)。
  * 3. 设定物理 MTU (1400)，规避 Overlay 网络的 IP 分片。
  * 
@@ -17,20 +17,18 @@
 
 /* 
  * [集群规模上限] 定义节点 ID 的位宽。
- * 设定为 20 位，意味着支持 2^20 = 1,048,576 个逻辑节点 ID。
- * 在分形架构中，这对应于全网唯一的虚拟节点 ID (Virtual ID)。
- * 注意：如果将其调大，需要同步调整网关的路由表内存分配大小。
+ * 默认设定为 12 位，意味着单 Pod 支持 2^12 = 4096 个逻辑节点 ID。
+ * 注意：若后续调大，需要同步调整网关路由表和相关内存分配策略。
  */
 #ifndef WVM_SLAVE_BITS
 /*
- * Default node-id bit width.
- * Userspace may target million-node scale; the in-kernel smoke-test path must
- * keep static allocations bounded (copyset_t/page_meta_t lives in-memory).
+ * Default node-id bit width (shared by user/kernel paths).
+ * Keep this bounded for predictable memory footprint in gateway/master.
  */
 #ifdef __KERNEL__
 #define WVM_SLAVE_BITS 12
 #else
-#define WVM_SLAVE_BITS 20
+#define WVM_SLAVE_BITS 12
 #endif
 #endif
 
