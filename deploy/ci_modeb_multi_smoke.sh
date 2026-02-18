@@ -122,7 +122,7 @@ if [[ "${ready}" -ne 1 ]]; then
   fail "startup_evidence_incomplete"
 fi
 
-congestion_count="$(grep -hc 'Severe Congestion' "${TMPD}"/master*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+congestion_count="$(grep -hc 'Severe Congestion' "${TMPD}"/master*.log 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)"
 if [[ "${congestion_count}" -gt 0 ]]; then
   warn "gateway_severe_congestion_detected_count=${congestion_count}"
 fi

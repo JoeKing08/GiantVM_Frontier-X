@@ -6252,9 +6252,38 @@ uint32_t g_curr_epoch = 0;
 uint8_t g_my_node_state = 1;
 
 __attribute__((weak)) int push_to_aggregator(uint32_t slave_id, void *data, int len) {
-    (void)slave_id; (void)data; (void)len;
-    errno = EAGAIN;
-    return -EAGAIN;
+    (void)slave_id;
+
+    if (!data || len <= 0) {
+        errno = EINVAL;
+        return -EINVAL;
+    }
+
+    if (g_tx_socket < 0) {
+        errno = EAGAIN;
+        return -EAGAIN;
+    }
+
+    struct sockaddr_in *target = &g_gateways[g_my_node_id];
+    if (target->sin_port == 0) {
+        errno = EHOSTUNREACH;
+        return -EHOSTUNREACH;
+    }
+
+    ssize_t sent = sendto(g_tx_socket, data, len, MSG_DONTWAIT,
+                          (struct sockaddr *)target, sizeof(*target));
+    if (sent == len) {
+        return 0;
+    }
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return -EAGAIN;
+        }
+        return -errno;
+    }
+
+    errno = EIO;
+    return -EIO;
 }
 
 // --- 外部引用 ---
