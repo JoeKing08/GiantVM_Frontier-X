@@ -41,6 +41,7 @@ extern void wavevm_start_vcpu_thread(CPUState *cpu);
 
 int g_wvm_local_split = 0;
 static bool g_wvm_split_explicit = false;
+static bool g_wvm_mode_explicit = false;
 
 static int wavevm_auto_split_from_vcpus(int vcpus)
 {
@@ -562,7 +563,9 @@ static int wavevm_init_machine(MachineState *ms) {
     char *role = getenv("WVM_ROLE");
     bool is_slave = (role && strcmp(role, "SLAVE") == 0);
 
-    if (is_slave) s->mode = WVM_MODE_USER;
+    if (is_slave && !g_wvm_mode_explicit) {
+        s->mode = WVM_MODE_USER;
+    }
 
     if (!has_kvm && !is_slave && s->mode == WVM_MODE_KERNEL) {
         return -1;
@@ -615,10 +618,12 @@ static void wavevm_set_mode(Object *obj, const char *value, Error **errp)
     WaveVMAccelState *s = WAVEVM_ACCEL(obj);
     if (g_strcmp0(value, "user") == 0) {
         s->mode = WVM_MODE_USER;
+        g_wvm_mode_explicit = true;
         return;
     }
     if (g_strcmp0(value, "kernel") == 0) {
         s->mode = WVM_MODE_KERNEL;
+        g_wvm_mode_explicit = true;
         return;
     }
     error_setg(errp, "Invalid mode '%s' (expected 'kernel' or 'user')", value);
