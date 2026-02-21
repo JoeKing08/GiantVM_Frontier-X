@@ -515,8 +515,20 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
         }
     }
         
-    // 初始化拦截信号
-    void *ram_ptr = memory_region_get_ram_ptr(ms->ram);
+    // 初始化拦截信号。某些机型在此时 ms->ram 仍可能为空，需做兜底查找。
+    void *ram_ptr = NULL;
+    if (ms->ram && memory_region_is_ram(ms->ram)) {
+        ram_ptr = memory_region_get_ram_ptr(ms->ram);
+    } else {
+        MemoryRegionSection sec = memory_region_find(&address_space_memory, 0, ms->ram_size ? ms->ram_size : 1);
+        if (sec.mr && memory_region_is_ram(sec.mr)) {
+            ram_ptr = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+        }
+    }
+    if (!ram_ptr) {
+        error_report("WaveVM: failed to resolve guest RAM pointer in user mode init");
+        return -ENODEV;
+    }
     wavevm_user_mem_init(ram_ptr, ms->ram_size);
 
     return 0;
