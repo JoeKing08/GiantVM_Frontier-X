@@ -12993,6 +12993,10 @@ index f099b5092..3da9023a8 100644
          aml_append(cpus_dev, method);
 ```
 
+### Step 9: 优化的网关 (Gateway)
+
+此模块运行在用户态，是连接 QEMU 和物理网络的枢纽。为了支持 1000,000 节点，必须使用 **按需分配（Lazy Allocation）** 策略，严禁一次性分配所有节点的缓冲区（那会瞬间消耗数百 MB 内存）。
+
 **文件**: `gateway_service/main.c`
 
 ```c
