@@ -1,3 +1,30 @@
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bac2d6fa2..98e0b5502 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -26,6 +26,8 @@
+ #include "hw/virtio/virtio-blk.h"
+ #include "dataplane/virtio-blk.h"
+ #include "scsi/constants.h"
++
++extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
+ #ifdef __linux__
+ # include <scsi/sg.h>
+ #endif
+@@ -672,6 +674,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+                                          req->qiov.size / BDRV_SECTOR_SIZE);
+         }
+ 
++        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
++            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
++            virtio_blk_free_request(req);
++            return 0;
++        }
++
+         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {
+             virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
+             block_acct_invalid(blk_get_stats(s->blk),
+
 diff --git a/hw/meson.build b/hw/meson.build
 index 010de7219..e2cd60b30 100644
 --- a/hw/meson.build
@@ -69,3 +96,128 @@ index 000000000..b2af780be
 +    g_free(linear_buf);
 +    return ret;
 +}
+diff --git a/accel/meson.build b/accel/meson.build
+index b26cca227..f3f6252f0 100644
+--- a/accel/meson.build
++++ b/accel/meson.build
+@@ -3,6 +3,7 @@
+ subdir('qtest')
+ subdir('kvm')
+ subdir('tcg')
++subdir('wavevm')
+ subdir('xen')
+ subdir('stubs')
+ 
+diff --git a/accel/wavevm/meson.build b/accel/wavevm/meson.build
+new file mode 100644
+index 000000000..68adef81c
+--- /dev/null
++++ b/accel/wavevm/meson.build
+@@ -0,0 +1,10 @@
++wavevm_ss = ss.source_set()
++wavevm_ss.add(files(
++  'wavevm-all.c',
++  'wavevm-cpu.c',
++  'wavevm-tcg.c',
++  'wavevm-user-mem.c',
++  '../../hw/wavevm/wavevm-mem.c',
++))
++
++specific_ss.add_all(when: ['CONFIG_SOFTMMU', 'CONFIG_POSIX'], if_true: wavevm_ss)
+diff --git a/accel/wavevm/wavevm-accel.h b/accel/wavevm/wavevm-accel.h
+new file mode 100644
+index 000000000..2c90c9447
+--- /dev/null
++++ b/accel/wavevm/wavevm-accel.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include "qemu/osdep.h"
++#include "qom/object.h"
++#include "sysemu/accel.h"
++#include "qemu/thread.h"
++
++/*
++ * Shared WaveVM accelerator definitions (used across wavevm-*.c files).
++ * Keep this header minimal: it only defines the accelerator state and
++ * identifiers needed by other compilation units.
++ */
++
++#define TYPE_WAVEVM_ACCEL "wavevm-accel"
++#define WAVEVM_ACCEL(obj) OBJECT_CHECK(WaveVMAccelState, (obj), TYPE_WAVEVM_ACCEL)
++
++typedef enum {
++    WVM_MODE_KERNEL,
++    WVM_MODE_USER,
++} WvmMode;
++
++typedef struct WaveVMAccelState {
++    AccelState parent_obj;
++    int dev_fd;
++    int sync_sock;
++    int ipc_sock;
++    WvmMode mode;
++    QemuThread sync_thread;
++    QemuThread ipc_thread;
++    QemuThread irq_thread;
++    bool sync_thread_running;
++    QemuThread net_thread;
++    int master_sock;
++} WaveVMAccelState;
++
++extern int g_wvm_local_split;
++
+diff --git a/hw/acpi/cpu.c b/hw/acpi/cpu.c
+index f099b5092..3da9023a8 100644
+--- a/hw/acpi/cpu.c
++++ b/hw/acpi/cpu.c
+@@ -349,9 +349,24 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+     MachineClass *mc = MACHINE_GET_CLASS(machine);
+     const CPUArchIdList *arch_ids = mc->possible_cpu_arch_ids(machine);
+     char *cphp_res_path = g_strdup_printf("%s." CPUHP_RES_DEVICE, res_root);
+-    Object *obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
+-    AcpiDeviceIfClass *adevc = ACPI_DEVICE_IF_GET_CLASS(obj);
+-    AcpiDeviceIf *adev = ACPI_DEVICE_IF(obj);
++    Object *obj;
++    AcpiDeviceIfClass *adevc;
++    AcpiDeviceIf *adev;
++
++    if (getenv("WVM_ENV_SOCK_PATH")) {
++        g_free(cphp_res_path);
++        return;
++    }
++
++    if (!arch_ids || (arch_ids->len > 0 && !arch_ids->cpus)) {
++        warn_report_once("WaveVM: invalid CPU arch-id list, skip CPU AML build");
++        g_free(cphp_res_path);
++        return;
++    }
++
++    obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
++    adevc = ACPI_DEVICE_IF_GET_CLASS(obj);
++    adev = ACPI_DEVICE_IF(obj);
+ 
+     cpu_ctrl_dev = aml_device("%s", cphp_res_path);
+     {
+@@ -468,6 +483,9 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+ 
+         method = aml_method(CPU_SCAN_METHOD, 0, AML_SERIALIZED);
+         {
++            aml_append(method, aml_return(zero));
++#if 0
++
+             const uint8_t max_cpus_per_pass = 255;
+             Aml *else_ctx;
+             Aml *while_ctx, *while_ctx2;
+@@ -609,10 +627,11 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+                  * just cleared the insert event for *all* CPUs in
+                  * CPU_ADDED_LIST, including the last one. So the scan will
+                  * simply seek past it.
+-                 */
++                */
+             }
+             aml_append(method, while_ctx2);
+             aml_append(method, aml_release(ctrl_lock));
++#endif
+         }
+         aml_append(cpus_dev, method);
