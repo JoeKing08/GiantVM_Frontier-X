@@ -54,6 +54,7 @@ static pthread_rwlock_t g_map_lock = PTHREAD_RWLOCK_INITIALIZER; // A global loc
 
 static struct sockaddr_in g_upstream_addr; // The address of the upstream gateway or master
 static volatile int g_primary_socket = -1; 
+static int g_upstream_tx_socket = -1;
 static int g_local_port = 0;
 int g_ctrl_port = 0; // 供应给 wavevm_gateway
 
@@ -420,22 +421,47 @@ static void* gateway_worker(void *arg) {
             if (pkt_len < sizeof(struct wvm_header)) continue;
             struct wvm_header *hdr = (struct wvm_header *)ptr;
             if (ntohl(hdr->magic) != WVM_MAGIC) continue;
+            uint16_t msg_type = ntohs(hdr->msg_type);
 
-            uint32_t slave_id = ntohl(hdr->slave_id); // 发送者的 ID
+            uint32_t source_id = ntohl(hdr->slave_id); // 发送者 ID
+            uint32_t target_id = ntohl(hdr->target_id); // 目标 ID（兼容旧逻辑时可能为 AUTO_ROUTE）
             
             // [关键]：只要收到合法的 WVM 包，就学习源路由
             // 排除掉 Upstream (Master/Core) 的 ID，只学习 Downstream (Leaf) 节点
             // 这里可以通过 ID 范围判断，或者简单地全部学习（Upstream 路由更新也无妨）
-            if (slave_id < WVM_MAX_SLAVES) {
-                learn_route(slave_id, &src_addrs[i]);
+            if (source_id < WVM_MAX_SLAVES) {
+                learn_route(source_id, &src_addrs[i]);
             }
 
             // Packets from upstream are always considered downstream.
             if (src->sin_addr.s_addr == g_upstream_addr.sin_addr.s_addr && src->sin_port == g_upstream_addr.sin_port) {
-                internal_push(local_fd, slave_id, ptr, pkt_len);
+                uint32_t route_id = source_id; // 兼容旧包：没有目标信息时按旧字段转发
+                if (target_id < WVM_MAX_SLAVES) {
+                    route_id = target_id;
+                } else if (target_id == WVM_NODE_AUTO_ROUTE) {
+                    route_id = source_id;
+                }
+                int r = internal_push(local_fd, route_id, ptr, pkt_len);
+                if (r < 0 && msg_type == MSG_VCPU_RUN) {
+                    fprintf(stderr, "[Gateway] upstream->route failed msg=%u route=%u err=%d\n",
+                            (unsigned)msg_type, route_id, r);
+                }
             } else {
                 // Packets from anywhere else are considered upstream.
-                sendto(local_fd, ptr, pkt_len, MSG_DONTWAIT, (struct sockaddr*)&g_upstream_addr, sizeof(g_upstream_addr));
+                int tx_fd = (g_upstream_tx_socket >= 0) ? g_upstream_tx_socket : local_fd;
+                ssize_t sret = sendto(tx_fd, ptr, pkt_len, MSG_DONTWAIT,
+                                      (struct sockaddr*)&g_upstream_addr, sizeof(g_upstream_addr));
+                if (msg_type == MSG_VCPU_RUN || msg_type == MSG_VCPU_EXIT || sret < 0) {
+                    char src_ip[INET_ADDRSTRLEN] = {0};
+                    char up_ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+                    inet_ntop(AF_INET, &g_upstream_addr.sin_addr, up_ip, sizeof(up_ip));
+                    fprintf(stderr, "[Gateway] route->upstream msg=%u src=%s:%u up=%s:%u ret=%zd errno=%d\n",
+                            (unsigned)msg_type,
+                            src_ip, (unsigned)ntohs(src->sin_port),
+                            up_ip, (unsigned)ntohs(g_upstream_addr.sin_port),
+                            sret, (sret < 0) ? errno : 0);
+                }
             }
         }
     }
@@ -525,6 +551,17 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
     g_upstream_addr.sin_family = AF_INET;
     g_upstream_addr.sin_addr.s_addr = inet_addr(upstream_ip);
     g_upstream_addr.sin_port = htons(upstream_port); 
+
+    // 单独的 upstream 发送 fd，避免复用 worker 的接收 fd 在某些环境下出现回环发送异常。
+    g_upstream_tx_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_upstream_tx_socket < 0) {
+        perror("[Gateway] upstream tx socket create failed");
+        return -1;
+    }
+    int tx_flags = fcntl(g_upstream_tx_socket, F_GETFL, 0);
+    if (tx_flags >= 0) {
+        fcntl(g_upstream_tx_socket, F_SETFL, tx_flags | O_NONBLOCK);
+    }
 
     long num_cores = get_nprocs();
     printf("[Gateway] System has %ld cores. Scaling out RX workers...\n", num_cores);

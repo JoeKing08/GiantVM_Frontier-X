@@ -71,6 +71,7 @@ struct wvm_header {
     uint16_t msg_type;
     uint16_t payload_len; 
     uint32_t slave_id;      // Source Node ID
+    uint32_t target_id;     // Destination Node ID (network order); AUTO_ROUTE means fallback
     union {
         uint64_t req_id;      // 给 ACK, VCPU_RUN 等事务 ID 用
         uint64_t target_gpa;  // 给 INVALIDATE, READ, WRITE 等地址指令用（旧版遗留）
@@ -80,7 +81,6 @@ struct wvm_header {
     uint8_t  mode_tcg;
     uint8_t  node_state;    // 发送者当前的生命周期状态
     uint32_t epoch;         // 发送者所处的逻辑周期
-    uint8_t  padding;
     uint32_t crc32;         // End-to-End Integrity Check
 } __attribute__((packed));
 

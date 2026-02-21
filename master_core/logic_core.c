@@ -114,9 +114,9 @@ static void flush_gossip_aggregator(void);
 void handle_rpc_batch_execution(void *payload, uint32_t len);
 
 // --- 指数退避与超时参数 ---
-#define INITIAL_RETRY_DELAY_US 1000      // 1ms
-#define MAX_RETRY_DELAY_US     1000000   // 1s
-#define TOTAL_TIMEOUT_US       5000000   // 5s
+#define INITIAL_RETRY_DELAY_US 50000      // 50ms
+#define MAX_RETRY_DELAY_US     500000     // 500ms
+#define TOTAL_TIMEOUT_US      20000000    // 20s
 
 // --- 目录表定义 ---
 #ifdef __KERNEL__

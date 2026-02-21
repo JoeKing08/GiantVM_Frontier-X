@@ -559,15 +559,19 @@ static MemoryListener wavevm_mem_listener = {
 
 static int wavevm_init_machine(MachineState *ms) {
     WaveVMAccelState *s = WAVEVM_ACCEL(ms->accelerator);
-    bool has_kvm = (access("/dev/kvm", R_OK | W_OK) == 0);
+    bool has_wvm_dev = (access("/dev/wavevm", R_OK | W_OK) == 0);
     char *role = getenv("WVM_ROLE");
     bool is_slave = (role && strcmp(role, "SLAVE") == 0);
 
-    if (is_slave && !g_wvm_mode_explicit) {
-        s->mode = WVM_MODE_USER;
+    if (!g_wvm_mode_explicit) {
+        if (is_slave) {
+            s->mode = WVM_MODE_USER;
+        } else {
+            s->mode = has_wvm_dev ? WVM_MODE_KERNEL : WVM_MODE_USER;
+        }
     }
 
-    if (!has_kvm && !is_slave && s->mode == WVM_MODE_KERNEL) {
+    if (s->mode == WVM_MODE_KERNEL && !has_wvm_dev) {
         return -1;
     }
 

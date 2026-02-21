@@ -176,9 +176,13 @@ static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
     if (req->slave_id == WVM_NODE_AUTO_ROUTE) {
         req->slave_id = wvm_get_compute_slave_id(req->vcpu_index);
     }
-    ack.status = wvm_rpc_call(MSG_VCPU_RUN, &req->ctx, 
-        req->mode_tcg ? sizeof(req->ctx.tcg) : sizeof(req->ctx.kvm), 
-        req->slave_id, &ack.ctx, sizeof(ack.ctx));
+    if (req->slave_id == WVM_NODE_AUTO_ROUTE) {
+        ack.status = -ENODEV;
+    } else {
+        ack.status = wvm_rpc_call(MSG_VCPU_RUN, &req->ctx,
+            req->mode_tcg ? sizeof(req->ctx.tcg) : sizeof(req->ctx.kvm),
+            req->slave_id, &ack.ctx, sizeof(ack.ctx));
+    }
     ack.mode_tcg = req->mode_tcg;
     write(qemu_fd, &ack, sizeof(ack));
 }
@@ -576,9 +580,8 @@ int main(int argc, char **argv) {
 
     printf("[+] WaveVM V29 Node Ready. Waiting for QEMU...\n");
 
-    // 10. 初始化 Backend 和 Logic Core
-    user_backend_init(my_phys_id, local_port);
-    wvm_core_init(&u_ops, 0);
+    // 10. Backend/Logic Core 已在前面初始化并注入拓扑。
+    // 此处严禁重复初始化，否则会重置 CPU 路由表为 AUTO_ROUTE。
 
     // 11. [自治扩展] 加载种子节点，不要求全量配置
     load_initial_seeds(config_file);

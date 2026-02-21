@@ -398,8 +398,46 @@ void* dirty_sync_sender_thread(void* arg) {
  * [后果] 这是分布式计算的“肌肉”。它让 Master 节点能像调用本地函数一样，将指令流分发到全网任意节点执行。
  */
 void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm_header *hdr, void *payload, int vcpu_id) {
-    if (t_vcpu_fd < 0) init_thread_local_vcpu(vcpu_id);
     struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)payload;
+    if (!req) return;
+
+    // 对“空上下文探针”走快速 ACK，避免在 KVM_RUN 中无意义阻塞。
+    // 仅匹配明显空输入，不影响真实执行上下文。
+    if ((req->mode_tcg && req->ctx.tcg.eip == 0) ||
+        (!req->mode_tcg && req->ctx.kvm.rip == 0 && req->ctx.kvm.rflags == 0)) {
+        struct wvm_header ack_hdr;
+        memset(&ack_hdr, 0, sizeof(ack_hdr));
+        ack_hdr.magic = htonl(WVM_MAGIC);
+        ack_hdr.msg_type = htons(MSG_VCPU_EXIT);
+        ack_hdr.payload_len = htons(sizeof(struct wvm_ipc_cpu_run_ack));
+        ack_hdr.slave_id = htonl(hdr->slave_id);
+        ack_hdr.target_id = htonl(hdr->slave_id);
+        ack_hdr.req_id = WVM_HTONLL(hdr->req_id);
+
+        struct wvm_ipc_cpu_run_ack ack;
+        memset(&ack, 0, sizeof(ack));
+        ack.status = 0;
+        ack.mode_tcg = req->mode_tcg;
+        if (req->mode_tcg) {
+            memcpy(&ack.ctx.tcg, &req->ctx.tcg, sizeof(req->ctx.tcg));
+        } else {
+            memcpy(&ack.ctx.kvm, &req->ctx.kvm, sizeof(req->ctx.kvm));
+        }
+
+        uint8_t tx[sizeof(ack_hdr) + sizeof(ack)];
+        memcpy(tx, &ack_hdr, sizeof(ack_hdr));
+        memcpy(tx + sizeof(ack_hdr), &ack, sizeof(ack));
+        struct wvm_header *tx_hdr = (struct wvm_header *)tx;
+        tx_hdr->crc32 = 0;
+        tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
+        ssize_t sret = sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
+        fprintf(stderr, "[Slave FastAck] ret=%zd errno=%d mode=%u req=%llu dst=%s:%u\n",
+                sret, (sret < 0) ? errno : 0, req->mode_tcg,
+                (unsigned long long)hdr->req_id, inet_ntoa(client->sin_addr), ntohs(client->sin_port));
+        return;
+    }
+
+    if (t_vcpu_fd < 0) init_thread_local_vcpu(vcpu_id);
     struct kvm_regs kregs; struct kvm_sregs ksregs;
     wvm_kvm_context_t *ctx = &req->ctx.kvm;
 
@@ -508,6 +546,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     ack_hdr.msg_type = htons(MSG_VCPU_EXIT);       
     ack_hdr.payload_len = htons(sizeof(struct wvm_ipc_cpu_run_ack));
     ack_hdr.slave_id = htonl(hdr->slave_id);       
+    ack_hdr.target_id = htonl(hdr->slave_id);
     ack_hdr.req_id = WVM_HTONLL(hdr->req_id);      
     
     struct wvm_ipc_cpu_run_ack *ack = (struct wvm_ipc_cpu_run_ack *)payload;
@@ -535,8 +574,16 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         memcpy(ack_kctx->mmio.data, t_kvm_run->mmio.data, 8);
     }
 
-    uint8_t tx[sizeof(ack_hdr) + sizeof(*ack)]; memcpy(tx, &ack_hdr, sizeof(ack_hdr)); memcpy(tx+sizeof(ack_hdr), ack, sizeof(*ack));
-    sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
+    uint8_t tx[sizeof(ack_hdr) + sizeof(*ack)];
+    memcpy(tx, &ack_hdr, sizeof(ack_hdr));
+    memcpy(tx+sizeof(ack_hdr), ack, sizeof(*ack));
+    struct wvm_header *tx_hdr = (struct wvm_header *)tx;
+    tx_hdr->crc32 = 0;
+    tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
+    ssize_t sret = sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
+    fprintf(stderr, "[Slave Ack] ret=%zd errno=%d req=%llu dst=%s:%u exit=%u\n",
+            sret, (sret < 0) ? errno : 0, (unsigned long long)hdr->req_id,
+            inet_ntoa(client->sin_addr), ntohs(client->sin_port), ack_kctx->exit_reason);
 }
 
 /* 

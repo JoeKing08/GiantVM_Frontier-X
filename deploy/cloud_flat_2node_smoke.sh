@@ -365,7 +365,7 @@ timeout "${VM_TIMEOUT}"s env WVM_ENV_SOCK_PATH="${WVM_ENV_SOCK_PATH}" "${QEMU_BI
   -name WVM-Flat-VMTest \
   -m "${VM_MEMORY_MB}" \
   -smp "${VM_SMP}" \
-  -accel wavevm,mode=user \
+  -accel wavevm \
   -drive "file=${IMG_PATH},if=virtio,format=qcow2,cache=none,aio=threads" \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
   -display none -serial "file:${LOG_CONSOLE}" -monitor none -no-reboot \

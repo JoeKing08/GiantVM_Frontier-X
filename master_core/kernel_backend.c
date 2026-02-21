@@ -427,6 +427,7 @@ static int k_send_packet(void *data, int len, uint32_t target_id) {
     hdr->epoch = htonl(g_kernel_epoch);
     // Node State 在内核态通常默认为 ACTIVE (2)，因为能跑内核模块说明节点活着
     hdr->node_state = 2; 
+    hdr->target_id = htonl(target_id);
 
     hdr->crc32 = 0;
     hdr->crc32 = htonl(calculate_crc32(data, len));

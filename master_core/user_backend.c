@@ -52,8 +52,6 @@ uint32_t g_curr_epoch = 0;
 uint8_t g_my_node_state = 1;
 
 __attribute__((weak)) int push_to_aggregator(uint32_t slave_id, void *data, int len) {
-    (void)slave_id;
-
     if (!data || len <= 0) {
         errno = EINVAL;
         return -EINVAL;
@@ -64,7 +62,12 @@ __attribute__((weak)) int push_to_aggregator(uint32_t slave_id, void *data, int 
         return -EAGAIN;
     }
 
-    struct sockaddr_in *target = &g_gateways[g_my_node_id];
+    if (slave_id >= WVM_MAX_GATEWAYS) {
+        errno = EINVAL;
+        return -EINVAL;
+    }
+
+    struct sockaddr_in *target = &g_gateways[slave_id];
     if (target->sin_port == 0) {
         errno = EHOSTUNREACH;
         return -EHOSTUNREACH;
@@ -369,6 +372,7 @@ static void u_send_packet_async(uint16_t msg_type, void* payload, int len, uint3
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
     hdr->slave_id = htonl(g_my_node_id);
+    hdr->target_id = htonl(target_id);
     hdr->req_id = 0;
     hdr->qos_level = qos;
     hdr->crc32 = 0;
@@ -418,6 +422,7 @@ static int raw_send(tx_node_t *node) {
 
     hdr->epoch = g_curr_epoch;
     hdr->node_state = g_my_node_state;
+    hdr->target_id = htonl(node->target_id);
     
     // 重新计算 CRC（因为 Header 变了）
     hdr->crc32 = 0;
@@ -615,6 +620,7 @@ static void handle_slave_read(int fd, struct sockaddr_in *dest, struct wvm_heade
     ack_hdr->payload_len = htons(sizeof(struct wvm_mem_ack_payload));
     ack_hdr->req_id = req->req_id;
     ack_hdr->slave_id = htonl(g_my_node_id);
+    ack_hdr->target_id = req->slave_id;
     ack_hdr->qos_level = 0; // 慢车道包
     ack_hdr->crc32 = 0;
 
@@ -821,6 +827,11 @@ static void* rx_thread_loop(void *arg) {
 
                     // [自治策略]：丢弃来自未来的非法包，或处理落后包
                     if (msg_epoch > g_curr_epoch + 5) {
+                        if (msg_type == MSG_VCPU_RUN) {
+                            u_log("[RX Drop Epoch] msg=%u src_port=%u epoch=%u local=%u",
+                                  (unsigned)msg_type, (unsigned)ntohs(src_addrs[i].sin_port),
+                                  msg_epoch, g_curr_epoch);
+                        }
                         // 跨度过大，可能是由于网络分区（Split-brain）后节点归队
                         // 这种情况下不能处理该包，应等待视图同步
                         continue;
@@ -829,11 +840,72 @@ static void* rx_thread_loop(void *arg) {
                     hdr->crc32 = htonl(received_crc);
                     void *payload = (void*)hdr + sizeof(struct wvm_header);
                 
+                    // [路由优先] Slave 业务包必须先分流，不能被 req_id 分支误判为 ACK。
+                    // 仅当包不是来自本地 slave 端口时，才转发到 slave 进程处理。
+                    int is_slave_service_msg =
+                        (msg_type == MSG_VCPU_RUN ||
+                         msg_type == MSG_BLOCK_WRITE ||
+                         msg_type == MSG_BLOCK_READ ||
+                         msg_type == MSG_BLOCK_FLUSH);
+                    int from_local_slave = (ntohs(src_addrs[i].sin_port) == (uint16_t)g_slave_forward_port);
+
+                    // 本地 Slave 的执行结果需要回传给真正发起方（跨节点请求场景）。
+                    // 回包目标放在 hdr->slave_id（请求源 ID）里。
+                    if (from_local_slave &&
+                        (msg_type == MSG_VCPU_EXIT || msg_type == MSG_BLOCK_ACK)) {
+                        uint32_t return_target = ntohl(hdr->slave_id);
+                        u_log("[Slave Return] msg=%u src_port=%u rid=%llu return_target=%u",
+                              (unsigned)msg_type, (unsigned)ntohs(src_addrs[i].sin_port),
+                              (unsigned long long)rid, (unsigned)return_target);
+                        if (return_target < WVM_MAX_GATEWAYS && return_target != (uint32_t)g_my_node_id) {
+                            int rr = u_send_packet(base_ptr + offset, current_pkt_len, return_target);
+                            u_log("[Slave Return] forward queued msg=%u rid=%llu target=%u ret=%d len=%d",
+                                  (unsigned)msg_type, (unsigned long long)rid,
+                                  (unsigned)return_target, rr, current_pkt_len);
+                            offset += current_pkt_len;
+                            continue;
+                        }
+                    }
+
+                    if (is_slave_service_msg && !from_local_slave) {
+                        struct sockaddr_in slave_addr = {
+                            .sin_family = AF_INET,
+                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                            .sin_port = htons(g_slave_forward_port)
+                        };
+                        ssize_t fw = sendto(sockfd, base_ptr + offset, current_pkt_len, 0,
+                                           (struct sockaddr*)&slave_addr, sizeof(slave_addr));
+                        if (fw < 0) {
+                            u_log("[Slave Forward] sendto failed: msg=%u src_port=%u dst_port=%d err=%d",
+                                  (unsigned)msg_type, (unsigned)ntohs(src_addrs[i].sin_port),
+                                  g_slave_forward_port, errno);
+                        } else if (msg_type == MSG_VCPU_RUN) {
+                            u_log("[Slave Forward] msg=%u src_port=%u dst_port=%d len=%d",
+                                  (unsigned)msg_type, (unsigned)ntohs(src_addrs[i].sin_port),
+                                  g_slave_forward_port, current_pkt_len);
+                        }
+                        offset += current_pkt_len;
+                        continue;
+                    }
+
                     // 分发逻辑
                     if (rid != 0 && rid != (uint64_t)-1) {
                         // 请求-响应模式 (ACK)
                         uint32_t idx = rid % MAX_INFLIGHT_REQS;
+                        if (msg_type == MSG_VCPU_EXIT) {
+                            u_log("[RX VCPU_EXIT] src_port=%u rid=%llu idx=%u p_len=%u",
+                                  (unsigned)ntohs(src_addrs[i].sin_port),
+                                  (unsigned long long)rid,
+                                  (unsigned)idx,
+                                  (unsigned)p_len);
+                        }
                         pthread_mutex_lock(&g_u_req_ctx[idx].lock);
+                        if (msg_type == MSG_VCPU_EXIT) {
+                            u_log("[RX VCPU_EXIT] slot idx=%u full_id=%llu has_buf=%d",
+                                  (unsigned)idx,
+                                  (unsigned long long)g_u_req_ctx[idx].full_id,
+                                  g_u_req_ctx[idx].rx_buffer ? 1 : 0);
+                        }
                         if (g_u_req_ctx[idx].rx_buffer && g_u_req_ctx[idx].full_id == rid) {
                     
                             // [V29 Final Fix] 处理带版本的 ACK
@@ -847,25 +919,14 @@ static void* rx_thread_loop(void *arg) {
                                 memcpy(g_u_req_ctx[idx].rx_buffer, payload, p_len);
                             }
                             g_u_req_ctx[idx].status = 1;
+                            if (msg_type == MSG_VCPU_EXIT) {
+                                u_log("[RX VCPU_EXIT] matched rid=%llu -> status=1",
+                                      (unsigned long long)rid);
+                            }
                         }
                         pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
 
                     } else {
-                        // [V30 核心修复] 如果是给 Slave 的活，转发到命令行指定的端口
-                        if (msg_type == MSG_VCPU_RUN || msg_type == MSG_BLOCK_WRITE || 
-                            msg_type == MSG_BLOCK_READ || msg_type == MSG_BLOCK_FLUSH) {
-                            
-                            struct sockaddr_in slave_addr = {
-                                .sin_family = AF_INET,
-                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-                                .sin_port = htons(g_slave_forward_port)
-                            };
-                            sendto(sockfd, base_ptr + offset, current_pkt_len, 0, 
-                                  (struct sockaddr*)&slave_addr, sizeof(slave_addr));
-
-                            offset += current_pkt_len;
-                            continue; // 转发完直接跳过，Master不处理
-                        }
                         // [V29 FINAL FIX] 客户端推送处理逻辑
                         // 如果是推送/失效消息，Daemon 必须自己处理（更新 SHM + 通知 QEMU）
                         // 而不能扔给只懂服务端业务的 logic_core
@@ -921,6 +982,12 @@ static void* rx_thread_loop(void *arg) {
                             wvm_logic_process_packet(hdr, payload, src_id);
                         }
                     }
+                } else if (msg_type == MSG_VCPU_RUN ||
+                           msg_type == MSG_VCPU_EXIT ||
+                           msg_type == MSG_BLOCK_ACK) {
+                    u_log("[RX CRC Mismatch] msg=%u src_port=%u recv=%08x calc=%08x len=%d",
+                          (unsigned)msg_type, (unsigned)ntohs(src_addrs[i].sin_port),
+                          received_crc, calculated_crc, current_pkt_len);
                 }
     
                 // 4. [关键] 指针移动到下一个包
