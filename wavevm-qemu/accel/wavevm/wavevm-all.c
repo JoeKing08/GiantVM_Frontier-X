@@ -44,6 +44,8 @@ static bool g_wvm_split_explicit = false;
 static bool g_wvm_mode_explicit = false;
 static void *g_primary_ram_hva = NULL;
 static uint64_t g_primary_ram_size = 0;
+static bool g_user_mem_inited = false;
+static uint64_t g_user_ram_size_hint = 0;
 
 static int wavevm_auto_split_from_vcpus(int vcpus)
 {
@@ -517,6 +519,7 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
         }
     }
         
+    g_user_ram_size_hint = ms->ram_size;
     // 初始化拦截信号。某些机型在此时 ms->ram 仍可能为空，需做兜底查找。
     void *ram_ptr = NULL;
     if (ms->ram && memory_region_is_ram(ms->ram)) {
@@ -530,11 +533,13 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
     if (!ram_ptr && g_primary_ram_hva) {
         ram_ptr = g_primary_ram_hva;
     }
-    if (!ram_ptr) {
-        error_report("WaveVM: failed to resolve guest RAM pointer in user mode init");
-        return -ENODEV;
+    if (ram_ptr) {
+        wavevm_user_mem_init(ram_ptr, g_primary_ram_size ? g_primary_ram_size : ms->ram_size);
+        g_user_mem_inited = true;
+    } else {
+        // 某些机型在该回调时序下 RAM block 尚未注册；在 region_add 首块时补初始化。
+        error_report("WaveVM: defer user mem init until first RAM block is registered");
     }
-    wavevm_user_mem_init(ram_ptr, g_primary_ram_size ? g_primary_ram_size : ms->ram_size);
 
     return 0;
 }
@@ -562,6 +567,10 @@ static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *sec
         if (start_gpa == 0 && !g_primary_ram_hva) {
             g_primary_ram_hva = hva;
             g_primary_ram_size = size;
+        }
+        if (start_gpa == 0 && !g_user_mem_inited) {
+            wavevm_user_mem_init(hva, g_user_ram_size_hint ? g_user_ram_size_hint : size);
+            g_user_mem_inited = true;
         }
     }
 }
