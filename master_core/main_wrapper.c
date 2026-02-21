@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "logic_core.h"
 #include "../common_include/wavevm_protocol.h"
@@ -372,6 +373,9 @@ void load_initial_seeds(const char *config_file) {
 
 // --- Main Entry ---
 int main(int argc, char **argv) {
+    // Prevent process-wide termination on EPIPE when a peer disconnects.
+    signal(SIGPIPE, SIG_IGN);
+
     // 参数检查
     if (argc < 7) {
         fprintf(stderr, "Usage: %s <RAM_MB> <LOCAL_PORT> <SWARM_CONFIG> <MY_PHYS_ID> <CTRL_PORT> <SLAVE_PORT> [SYNC_BATCH]\n", argv[0]);
