@@ -370,7 +370,7 @@ export WVM_ENV_SOCK_PATH=$(strings /proc/$(pgrep -f wavevm_node_master)/environ 
   # --- [A] 物理内存加固：强制开启 2MB 硬件大页 (Hugepages) ---
   # 理由：消除 500PB 空间映射导致的页表内存溢出，TLB 命中率提升 200%
   # --- [B] 分布式存储挂载：利用 /dev/zero 欺骗，实现线性化拦截 ---
-  # 理由：hw-wavevm.diff 会劫持此路径，将 IO 路由至全网 Slave 物理 Chunk
+  # 理由：qemu-wavevm.diff 会劫持此路径，将 IO 路由至全网 Slave 物理 Chunk
   # --- [C] 本地硬件直通：Node 0 物理显卡 ---
   # --- [D] 远程硬件物理锚定：Node 1 伪装显卡 (核心 DMA 解决逻辑) ---
   # 1. 创造物理隔离的总线 (Bus 0x20)，并将其逻辑绑定到 vNUMA 1
@@ -5169,7 +5169,15 @@ static struct wvm_mem_slot g_mem_slots[MAX_WVM_SLOTS];
 // [NEW IOCTL] 动态注入 Guest 内存布局
 static int wvm_set_mem_layout(struct wvm_ioctl_mem_layout *layout) {
     if (layout->count > MAX_WVM_SLOTS) return -EINVAL;
-    
+
+    /* Reset old slots first to avoid stale ranges after restart/reconfigure. */
+    for (int i = 0; i < MAX_WVM_SLOTS; i++) {
+        g_mem_slots[i].active = false;
+        g_mem_slots[i].start_gpa = 0;
+        g_mem_slots[i].size = 0;
+        g_mem_slots[i].host_offset = 0;
+    }
+
     for (int i = 0; i < layout->count; i++) {
         g_mem_slots[i].start_gpa = layout->slots[i].start;
         g_mem_slots[i].size = layout->slots[i].size;
@@ -6005,6 +6013,12 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         uint32_t irq = 16; 
         if (copy_to_user(argp, &irq, sizeof(irq))) return -EFAULT;
         break;
+    }
+
+    case IOCTL_SET_MEM_LAYOUT: {
+        struct wvm_ioctl_mem_layout layout;
+        if (copy_from_user(&layout, argp, sizeof(layout))) return -EFAULT;
+        return wvm_set_mem_layout(&layout);
     }
 
     // 我们复用 MEM_ROUTE 协议来传输简单的全局整数参数
@@ -12765,7 +12779,7 @@ int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write)
 }
 ```
 
-**文件**: `qemu_patch/hw-wavevm.diff`
+**文件**: `qemu_patch/qemu-wavevm.diff`
 
 ```diff
 diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
@@ -12991,6 +13005,7 @@ index f099b5092..3da9023a8 100644
 +#endif
          }
          aml_append(cpus_dev, method);
+ 
 ```
 
 ### Step 9: 优化的网关 (Gateway)
@@ -13751,7 +13766,7 @@ clean:
     ```bash
     cd wavevm-qemu
     # Patch: 统一补丁（包含 virtio-blk 拦截与 wavevm 构建接线）
-    patch -p1 < ../qemu_patch/hw-wavevm.diff
+    patch -p1 < ../qemu_patch/qemu-wavevm.diff
     ```
 
 7.  **配置并编译 QEMU-Wavelet**
@@ -13842,13 +13857,13 @@ clean:
 
 ### 补丁文件
 
-- `qemu_patch/hw-wavevm.diff`
+- `qemu_patch/qemu-wavevm.diff`
 
 ### 应用方式（从仓库根目录）
 
 ```bash
 cd wavevm-qemu
-patch -p1 < ../qemu_patch/hw-wavevm.diff
+patch -p1 < ../qemu_patch/qemu-wavevm.diff
 ./configure --target-list=x86_64-softmmu --enable-kvm --enable-debug
 make -j$(nproc) qemu-system-x86_64
 ./qemu-system-x86_64 --version
@@ -14043,3 +14058,345 @@ make -j$(nproc) qemu-system-x86_64
 - 分布式存储实现路径未被改写为伪实现或绕过实现。
 
 > 结论：截至 2026-02-21，在不启用分布式存储条件下，扁平化与分形两种双节点算力链路均已跑通，并完成 VM 交互验证；长时稳定性压测不在本节覆盖范围内。
+
+---
+
+## 🧪 2026-02-22 本次测试完整记录（全量过程归档）
+
+说明：
+- 本节为 2026-02-22 当天的完整实操记录。
+- 目标是“按 2026-02-21 口径复现（先扁平化后分形化，tmux 保活）”。
+- 本节包含：环境、配置、命令、现象、修复、风险事件与后续建议。
+- 本节不覆盖前文历史结论，仅记录本次会话实际执行结果。
+
+### 0. 执行背景与约束
+
+- 用户更正了 `info.txt` 的实例端口范围（第二组从错误端口段修正为 `16700-16799`）。
+- 用户要求：
+  1. 先扁平化（flat）后分形化（fract）。
+  2. 全程 `tmux` 保活。
+  3. 尽量复现“昨天成功结果”。
+  4. 仅对白名单范围清理，避免误删云实例其他内容。
+- 实际受限：
+  - 当前执行环境为 GitHub Codespaces，远端实例连接通过 `ssh -p`。
+  - 远端环境出现“伪终端拒绝（Failed to get a pseudo terminal: Permission denied）”与公网端口不稳定问题。
+
+### 1. 实例信息（本次实际使用）
+
+来源：`info.txt`（更正后）
+
+- Node1
+  - SSH：`root@111.6.167.245:8033`
+  - 密码：`W3HtDHENb2i6CmAqf4r97VsyQAotpTVy`
+  - 公网端口段：`13200-13299`
+- Node2
+  - SSH：`root@111.6.167.245:8068`
+  - 密码：`YBhe3gv1prIdqbjkUrw87PDa7AR9vsrv`
+  - 公网端口段：`16700-16799`
+
+本次探测到的私网地址（重启前）：
+- Node1：`172.30.0.133/23`
+- Node2：`172.30.0.168/23`
+
+### 2. 代码基线与远端同步策略
+
+- 本地仓库基线：`origin/main` 对应 `2e45b13b8`。
+- 由于全仓库体积较大（约 862MB），全量 `git archive` 远程同步耗时过长，改为“测试相关目录增量同步”：
+  - `gateway_service`
+  - `master_core`
+  - `slave_daemon`
+  - `common_include`
+  - `deploy`
+  - `qemu_patch`
+  - `wavevm-qemu/accel`
+  - `wavevm-qemu/hw/wavevm`
+  - `wavevm-qemu/hw/acpi/cpu.c`
+
+### 3. 白名单清理策略（避免误删）
+
+本次执行过“安全清理”，仅包含：
+
+1. 仅清理 WaveVM 测试相关 `tmux` 会话：
+   - `flat-*`、`fract-*`、`modea-*`、`modeb-*`、`wvm*`
+2. 仅清理已知进程名：
+   - `wavevm_gateway`
+   - `wavevm_node_master`
+   - `wavevm_node_slave`
+   - `qemu-system-x86_64`
+   - `timeout`（测试残留）
+3. 仅清理测试产物目录：
+   - `/root/wvmtest/logs/*`
+   - `/root/wvmtest/run/*`
+4. 仅清理测试共享内存命名：
+   - `/dev/shm/wavevm_flat_node*`
+   - `/dev/shm/wavevm_fract_node*`
+   - `/dev/shm/wvm_*`
+
+明确未执行：
+- 未删除系统目录。
+- 未删除用户其他业务目录。
+- 未执行 `rm -rf /` 级别危险操作。
+
+### 4. 构建与二进制确认（重启前）
+
+两节点均执行：
+- `make -C gateway_service`
+- `make -C slave_daemon`
+- `make -C master_core -f Makefile_User`
+
+Node1 额外执行：
+- `make -C wavevm-qemu/build -j$(nproc) qemu-system-x86_64`
+- `qemu-system-x86_64 -accel help` 输出包含：
+  - `tcg`
+  - `kvm`
+  - `wavevm`
+
+### 5. 本次实际配置文件全文（关键）
+
+#### 5.1 Flat 拓扑与路由
+
+`/root/wvmtest/conf/flat_topo_pub.conf`
+```txt
+NODE 0 111.6.167.245 13220 6 4
+NODE 1 111.6.167.245 16720 6 4
+```
+
+`/root/wvmtest/conf/flat_routes_pub.conf`
+```txt
+ROUTE 0 1 111.6.167.245 13210
+ROUTE 1 1 111.6.167.245 16710
+```
+
+#### 5.2 Fract 拓扑与路由
+
+`/root/wvmtest/conf/fract_topo_pub.conf`
+```txt
+NODE 0 111.6.167.245 13220 6 4
+NODE 1 111.6.167.245 16720 6 4
+```
+
+`/root/wvmtest/conf/fract_l1.conf`
+```txt
+ROUTE 0 1 111.6.167.245 13210
+ROUTE 1 1 111.6.167.245 16710
+```
+
+`/root/wvmtest/conf/fract_sidecar_a.conf`
+```txt
+ROUTE 0 1 111.6.167.245 13230
+ROUTE 1 1 111.6.167.245 13230
+```
+
+`/root/wvmtest/conf/fract_sidecar_b.conf`
+```txt
+ROUTE 0 1 111.6.167.245 16730
+ROUTE 1 1 111.6.167.245 16730
+```
+
+`/root/wvmtest/conf/fract_l2a.conf`
+```txt
+ROUTE 0 1 111.6.167.245 13240
+ROUTE 1 1 111.6.167.245 13240
+```
+
+`/root/wvmtest/conf/fract_l2b.conf`
+```txt
+ROUTE 0 1 111.6.167.245 13240
+ROUTE 1 1 111.6.167.245 13240
+```
+
+### 6. 启动策略与 tmux 会话（重启前）
+
+#### 6.1 Flat 启动
+
+Node1（8033）：
+- `flat-gw`：`wavevm_gateway 13220 ... master=13210 ctrl=13221`
+- `flat-master`：`wavevm_node_master 4096 13210 ... node_id=0 ctrl=13211 slave=13225`
+- `flat-slave`：`wavevm_node_slave 13225 ... node_id=0 ctrl=13211`
+
+Node2（8068）：
+- `flat-gw`：`wavevm_gateway 16720 ... master=16710 ctrl=16721`
+- `flat-master`：`wavevm_node_master 4096 16710 ... node_id=1 ctrl=16711 slave=16725`
+- `flat-slave`：`wavevm_node_slave 16725 ... node_id=1 ctrl=16711`
+
+#### 6.2 Fract 启动
+
+Node1（8033）：
+- `fract-sidecar-a`：`13220 -> 13230`
+- `fract-l2a`：`13230 -> 13240`
+- `fract-l1`：`13240 -> 13210`
+- `fract-master`：`master=13210 node_id=0 ctrl=13211 slave=13225`
+- `fract-slave`：`slave=13225 node_id=0 ctrl=13211`
+
+Node2（8068）：
+- `fract-sidecar-b`：`16720 -> 16730`
+- `fract-l2b`：`16730 -> 111.6.167.245:13240`
+- `fract-master`：`master=16710 node_id=1 ctrl=16711 slave=16725`
+- `fract-slave`：`slave=16725 node_id=1 ctrl=16711`
+
+### 7. 模式确认（重启前）
+
+按用户“一个 modeA + 一个 modeB”要求核实：
+
+- Node1：`/dev/wavevm` 存在，`lsmod` 可见 `wavevm`（modeA）
+- Node2：`/dev/wavevm` 不存在，`wavevm` 模块未加载（modeB）
+
+### 8. 验证命令与观测结果（重启前）
+
+#### 8.1 Flat 链路
+
+观测结果：
+- Node1 `flat-master-pub.log`：
+  - `New neighbor discovered: 1`
+  - `Transition to WARMING`
+  - `Transition to ACTIVE`
+- Node2 `flat-master-pub.log`：
+  - `Failed to open /dev/wavevm (Kernel Mode disabled?)`
+  - `New neighbor discovered: 0`
+  - `Transition to WARMING`
+  - `Transition to ACTIVE`
+
+结论：
+- Flat 双节点控制链路已稳定到 ACTIVE。
+
+#### 8.2 Flat VM（WaveVM）
+
+启动脚本：`/root/wvmtest/run_flat_wavevm_vm.sh`
+
+关键日志（`flat-vm-wavevm.log`）：
+- `Failed to sync memory layout to kernel (continue): Invalid argument`
+- `[WaveVM-QEMU] KERNEL MODE: Connecting to /dev/wavevm...`
+- 多次 `kernel path ... mode_tcg=1`
+
+观测：
+- `flat-vm-wavevm-console.log` 大小为 `0`
+- VM 转发端口 `13226` 出现“超时/拒绝”切换
+- 未形成稳定 guest 登录
+
+结论：
+- Flat 下 WaveVM VM 未进入可交互状态。
+
+#### 8.3 Fract 链路
+
+观测结果：
+- Node1 `fract-master-pub.log`：
+  - `New neighbor discovered: 1`
+  - `Transition to WARMING`
+  - `Transition to ACTIVE`
+- Node2 `fract-master-pub.log`：
+  - `Failed to open /dev/wavevm (Kernel Mode disabled?)`
+  - `New neighbor discovered: 0`
+  - `Transition to WARMING`
+  - `Transition to ACTIVE`
+
+结论：
+- Fract 双节点控制链路已稳定到 ACTIVE。
+
+#### 8.4 Fract VM（WaveVM）
+
+启动脚本：`/root/wvmtest/run_fract_wavevm_vm.sh`
+
+关键日志（`fract-vm-wavevm-new.log`）：
+- 同样出现 `Failed to sync memory layout to kernel (continue): Invalid argument`
+- 串口日志 `fract-vm-wavevm-new-console.log` 大小为 `0`
+
+补充探测（本轮曾测试）：
+- `run_fract_wavevm_vm_smp1.sh`：`rc=139`（core dumped）
+- `run_fract_wavevm_vm_split2.sh`：`rc=139`（core dumped）
+
+结论：
+- Fract 下 WaveVM VM 同样未进入可交互状态。
+
+### 9. 与“昨天成功”的差异判断
+
+依据前文与当日实操，至少有两类差异：
+
+1. 登录链路差异
+   - 历史成功记录偏向“先上节点，再连 `127.0.0.1` guest 转发端口”（例如 `127.0.0.1:2226`）。
+   - 公网直连端口在云环境中波动明显，不宜作为唯一判据。
+
+2. 运行时状态差异
+   - 本轮 `IOCTL_SET_MEM_LAYOUT` 路径出现稳定 `EINVAL` 特征（见下一节修复）。
+   - 同一代码在不同实例状态下可能从“偶发”变为“稳定复现”。
+
+### 10. 本轮代码修复（已入仓库）
+
+#### 10.1 修复 `IOCTL_SET_MEM_LAYOUT` 漏处理（核心）
+
+文件：`master_core/kernel_backend.c`
+
+修复点：
+1. 在 `wvm_ioctl()` 中新增：
+   - `case IOCTL_SET_MEM_LAYOUT`
+   - `copy_from_user` 后调用 `wvm_set_mem_layout()`
+2. 在 `wvm_set_mem_layout()` 增加槽位重置：
+   - 先清空 `g_mem_slots[]`，再写入新布局
+   - 避免旧布局残留造成地址判定异常
+
+原因：
+- QEMU 端明确调用 `IOCTL_SET_MEM_LAYOUT`，内核未处理时会落入 `default: -EINVAL`，与日志完全吻合。
+
+#### 10.2 修复 kernel 模式重复初始化（潜在不稳定源）
+
+文件：`wavevm-qemu/accel/wavevm/wavevm-all.c`
+
+修复点：
+- 删除 `wavevm_init_machine()` 中“额外打开 `/dev/wavevm` + 额外起 IRQ 线程”的重复块。
+- 保留 `wavevm_init_machine_kernel()` 单一路径初始化。
+
+原因：
+- 重复初始化在环境变化时可能引入 FD/线程行为不一致，增加不确定性。
+
+### 11. 风险事件记录（实例重启）
+
+在用户确认“做吧”后，本轮执行过两台实例 `reboot`：
+
+- Node1：`8033`
+- Node2：`8068`
+
+随后探测结果：
+- 在观测窗口内 `8033/8068` 未恢复连通。
+- 对 `22/8033/8068` 等端口的短探测均未命中开放。
+
+风险结论：
+- 该云平台实例“重启后回收不确定性”较高。
+- 后续建议将“重启”降为最后手段，优先走代码修复与服务级重拉起。
+
+### 12. 本轮最终结论
+
+1. 控制链路结论
+- Flat 与 Fract 双节点链路均可稳定进入 ACTIVE。
+
+2. VM 结论
+- WaveVM VM 在 Flat/Fract 两条路径均未恢复到稳定可登录。
+- 核心错误特征是 `IOCTL_SET_MEM_LAYOUT` 关联的 `EINVAL`（已针对性修复）。
+
+3. 工程结论
+- “昨天成功、今天失败”更符合“环境变化触发隐性缺陷”的表现，而非单一配置错误。
+- 本轮代码修复已优先覆盖该类缺陷路径，待新实例环境回归验证。
+
+### 13. 下一轮复测建议（最小成本）
+
+1. 新实例拉起后先只验证一条最小路径：
+   - Node1 modeA + Node2 modeB
+   - Flat 链路 + 单 VM
+2. 严格按顺序：
+   - 编译 -> 启服务 -> 看邻居 -> 起 VM -> 仅节点本机回环登录验证
+3. 仅在必要时切 Fract，避免同时变量过多。
+
+### 14. 远端提交流程（操作备忘）
+
+如需将当前修复提交到远端分支，可使用（按目标分支替换）：
+
+```bash
+git status --short
+git add Gemini.md master_core/kernel_backend.c wavevm-qemu/accel/wavevm/wavevm-all.c
+git commit -m "fix: handle mem layout ioctl and remove duplicate kernel init; sync Gemini record"
+git push origin HEAD:main
+```
+
+注意：
+- 建议优先推到临时分支做 CI/实机验证，再决定是否覆盖主分支。
+
+补充说明：
+- 前文相关代码块已同步为仓库对应文件内容，无需再额外附加差异片段。

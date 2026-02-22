@@ -611,16 +611,6 @@ static int wavevm_init_machine(MachineState *ms) {
 
     memory_listener_register(&wavevm_mem_listener, &address_space_memory);
 
-    if (s->mode == WVM_MODE_KERNEL) {
-        s->dev_fd = open("/dev/wavevm", O_RDWR);
-        if (s->dev_fd < 0) return -errno;
-        
-        wavevm_sync_topology(s->dev_fd); 
-        
-        wavevm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
-        qemu_thread_create(&s->irq_thread, "wvm-k-irq", wavevm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
-    } 
-
     if (s->mode == WVM_MODE_KERNEL) ret = wavevm_init_machine_kernel(s, ms);
     else ret = wavevm_init_machine_user(s, ms);
     if (ret < 0) return ret;

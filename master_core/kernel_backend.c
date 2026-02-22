@@ -487,7 +487,15 @@ static struct wvm_mem_slot g_mem_slots[MAX_WVM_SLOTS];
 // [NEW IOCTL] 动态注入 Guest 内存布局
 static int wvm_set_mem_layout(struct wvm_ioctl_mem_layout *layout) {
     if (layout->count > MAX_WVM_SLOTS) return -EINVAL;
-    
+
+    /* Reset old slots first to avoid stale ranges after restart/reconfigure. */
+    for (int i = 0; i < MAX_WVM_SLOTS; i++) {
+        g_mem_slots[i].active = false;
+        g_mem_slots[i].start_gpa = 0;
+        g_mem_slots[i].size = 0;
+        g_mem_slots[i].host_offset = 0;
+    }
+
     for (int i = 0; i < layout->count; i++) {
         g_mem_slots[i].start_gpa = layout->slots[i].start;
         g_mem_slots[i].size = layout->slots[i].size;
@@ -1323,6 +1331,12 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         uint32_t irq = 16; 
         if (copy_to_user(argp, &irq, sizeof(irq))) return -EFAULT;
         break;
+    }
+
+    case IOCTL_SET_MEM_LAYOUT: {
+        struct wvm_ioctl_mem_layout layout;
+        if (copy_from_user(&layout, argp, sizeof(layout))) return -EFAULT;
+        return wvm_set_mem_layout(&layout);
     }
 
     // 我们复用 MEM_ROUTE 协议来传输简单的全局整数参数

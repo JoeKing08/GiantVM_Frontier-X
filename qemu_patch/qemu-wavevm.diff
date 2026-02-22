@@ -221,3 +221,4 @@ index f099b5092..3da9023a8 100644
 +#endif
          }
          aml_append(cpus_dev, method);
+ 
